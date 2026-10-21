@@ -305,6 +305,26 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users
   for each row execute function public.handle_new_user();
 
+-- Accounts that signed up before this file was applied never fired the trigger.
+-- Without a profile they can sign in but not create, join or be added as
+-- staff, since all three reference profiles. Same rules as handle_new_user();
+-- a no-op once everyone has one, so re-applying this file is safe.
+insert into profiles (id, username, display_name, avatar_url)
+select
+  u.id,
+  coalesce(nullif(b.base, ''), 'player') || '_' || substr(encode(extensions.gen_random_bytes(3), 'hex'), 1, 5),
+  nullif(left(coalesce(u.raw_user_meta_data ->> 'full_name',
+                       u.raw_user_meta_data ->> 'name',
+                       split_part(u.email, '@', 1)), 60), ''),
+  u.raw_user_meta_data ->> 'avatar_url'
+from auth.users u
+cross join lateral (
+  select case when char_length(s) < 3 then 'player' else s end as base
+  from (select left(regexp_replace(lower(split_part(coalesce(u.email, ''), '@', 1)), '[^a-z0-9_]+', '', 'g'), 16) as s) raw
+) b
+where not exists (select 1 from profiles p where p.id = u.id)
+on conflict (id) do nothing;
+
 -- A slug from the title when none is given, with a short random tail so two
 -- "Saturday Rapid" events never collide and the URL cannot be guessed from a
 -- title alone.
