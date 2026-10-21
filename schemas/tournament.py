@@ -54,12 +54,21 @@ class TournamentCreate(_Strict):
     def _coherent(self) -> "TournamentCreate":
         if self.variant not in _VARIANTS[self.game]:
             raise ValueError(f"{self.game} is played as {', '.join(sorted(_VARIANTS[self.game]))}, not {self.variant}.")
-        if self.format == "arena" and self.arena_minutes is None:
-            raise ValueError("An arena runs for a duration: set arena_minutes.")
-        if self.format != "arena" and self.rounds_count is None:
-            raise ValueError("Set rounds_count.")
+        if (self.format == "arena") != (self.arena_minutes is not None):
+            raise ValueError("arena_minutes is set for an arena, and only for an arena.")
+        if self.format == "swiss" and self.rounds_count is None:
+            raise ValueError("A Swiss event needs rounds_count.")
+        if self.format in ("round_robin", "knockout") and self.rounds_count is not None:
+            # Follows from the field - n - 1 games, or log2 n rounds - so a number
+            # here would be one the pairing engine has to ignore.
+            raise ValueError(f"A {self.format.replace('_', ' ')} sets its own rounds from the field; omit rounds_count.")
         if self.requires_code and not self.entry_code:
             raise ValueError("A tournament that requires a code needs an entry_code.")
+        if self.entry_code and not self.requires_code:
+            # Stored and ignored is the worst outcome: the organiser believes the
+            # event is protected while anyone can walk in. Found on the live
+            # database, 2026-10-21.
+            raise ValueError("An entry_code only gates entry when requires_code is true.")
         return self
 
 

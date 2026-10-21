@@ -21,6 +21,7 @@ from postgrest import APIError
 from config import Settings
 from db import fail
 from main import app
+from schemas.tournament import TournamentCreate
 
 client = TestClient(app)
 AUTH = {"Authorization": "Bearer not-a-real-token"}
@@ -124,11 +125,30 @@ def test_create_refuses_fields_the_caller_may_not_set(extra):
         ({"game": "checkers", "variant": "standard"}, "checkers with the chess variant"),
         ({"format": "arena", "rounds_count": None}, "an arena with no duration"),
         ({"requires_code": True}, "a code-only event with no code"),
+        ({"entry_code": "LIVE42"}, "a code on an event that does not require one - stored and ignored"),
+        ({"format": "swiss", "rounds_count": None}, "a Swiss event with no round count"),
+        ({"format": "round_robin"}, "a round robin with an invented round count"),
+        ({"format": "swiss", "arena_minutes": 60}, "a Swiss event with an arena duration"),
         ({"clock_base_s": 5}, "a five-second game"),
     ],
 )
 def test_create_refuses_incoherent_tournaments(change, why):
     assert client.post("/v1/tournaments", json={**GOOD, **change}, headers=AUTH).status_code == 422, why
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"format": "round_robin", "rounds_count": None},
+        {"format": "knockout", "rounds_count": None},
+        {"format": "arena", "rounds_count": None, "arena_minutes": 60},
+        {"requires_code": True, "entry_code": "LIVE42"},
+    ],
+)
+def test_create_accepts_each_format_shape(change):
+    # The validator, not the route: a valid body would go on to call Supabase.
+    body = {k: v for k, v in {**GOOD, **change}.items() if v is not None}
+    TournamentCreate(**body)
 
 
 def test_update_cannot_change_what_is_being_played():

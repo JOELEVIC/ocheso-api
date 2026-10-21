@@ -132,10 +132,22 @@ create table if not exists public.tournaments (
     (game = 'chess'    and variant = 'standard') or
     (game = 'checkers' and variant in ('international', 'brazilian'))
   ),
-  constraint arena_has_duration check (
-    (format = 'arena' and arena_minutes is not null) or
-    (format <> 'arena' and rounds_count is not null)
+  constraint format_shape check (
+    (format = 'arena') = (arena_minutes is not null)
+    and (format <> 'swiss' or rounds_count is not null)
   )
+);
+
+-- Only a Swiss event has a round count the organiser chooses. A round robin's
+-- follows from its field (n - 1), a knockout's from its bracket (log2 n), and
+-- neither is known until entries close - so asking for one at creation made
+-- organisers invent a number the pairing engine would have to ignore.
+-- Replaces arena_has_duration on databases created before this change.
+alter table public.tournaments drop constraint if exists arena_has_duration;
+alter table public.tournaments drop constraint if exists format_shape;
+alter table public.tournaments add constraint format_shape check (
+  (format = 'arena') = (arena_minutes is not null)
+  and (format <> 'swiss' or rounds_count is not null)
 );
 
 create index if not exists tournaments_owner_idx on public.tournaments (owner_id);
