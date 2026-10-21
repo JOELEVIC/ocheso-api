@@ -114,12 +114,15 @@ check(
           "where n.nspname = 'public' and p.proname in ('is_tournament_owner', 'is_tournament_manager', "
           "'is_tournament_staff', 'is_tournament_participant', 'roster_is_public')") == "0",
 )
+# The read paths a visitor needs: an event by its link, its players, and -
+# once db/play.sql is applied - its scoreboard and the server clock.
+ANON_CALLABLE = {"get_roster", "get_tournament", "get_results", "server_now"}
 check(
-    "no public function an anonymous visitor can call except the two read paths",
-    value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
-          "join pg_namespace n on n.oid = p.pronamespace "
-          "where n.nspname = 'public' and p.prorettype <> 'trigger'::regtype "
-          "and has_function_privilege('anon', p.oid, 'execute')") == "get_roster,get_tournament",
+    "no public function an anonymous visitor can call except the read paths",
+    set(value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
+              "join pg_namespace n on n.oid = p.pronamespace "
+              "where n.nspname = 'public' and p.prorettype <> 'trigger'::regtype "
+              "and has_function_privilege('anon', p.oid, 'execute')").split(",")) <= ANON_CALLABLE,
     value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
           "join pg_namespace n on n.oid = p.pronamespace "
           "where n.nspname = 'public' and p.prorettype <> 'trigger'::regtype "

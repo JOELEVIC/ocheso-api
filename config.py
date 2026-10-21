@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     # Where invite links point.
     SITE_URL: str = "https://www.ocheso.com"
 
+    # Signs the referee's rulings (see play/referee.py, db/play.sql). It can
+    # vouch for a move and nothing else: it reads no rows and bypasses no policy.
+    # Without it the API still runs; only play is refused.
+    REFEREE_SECRET: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @model_validator(mode="after")
