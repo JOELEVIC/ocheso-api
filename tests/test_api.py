@@ -244,3 +244,15 @@ def test_other_origins_may_not():
 
 def test_health_claims_only_what_it_checks():
     assert client.get("/health").json() == {"ok": True, "service": "ocheso-api"}
+
+
+def test_rows_takes_a_single_row_function_result():
+    # PostgREST returns a function's single row as an object. Listing a dict
+    # yields its keys, which crashed /v1/me for every signed-in user.
+    from types import SimpleNamespace
+
+    from db import rows
+
+    assert rows(SimpleNamespace(data={"id": "u1", "username": "joel"})) == [{"id": "u1", "username": "joel"}]
+    assert rows(SimpleNamespace(data=[{"id": "u1"}])) == [{"id": "u1"}]
+    assert rows(SimpleNamespace(data=None)) == []

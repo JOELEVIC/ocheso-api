@@ -100,7 +100,13 @@ def fail(error: APIError) -> HTTPException:
 
 
 def rows(response: Any) -> list[dict]:
-    return list(response.data or [])
+    data = response.data
+    # A function returning one row (me(), join_tournament()) comes back as an
+    # object, not a list - and list() of a dict is its keys. That made /v1/me
+    # answer 500 to every signed-in user.
+    if isinstance(data, dict):
+        return [data]
+    return list(data or [])
 
 
 def one(response: Any, missing: str = "Not found.") -> dict:
