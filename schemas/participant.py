@@ -1,26 +1,48 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, Literal
+from __future__ import annotations
 
-class ParticipantCreate(BaseModel):
-    tournament_id: str
-    user_id: str
-    email: str
-    status: Literal['Approved', 'Pending'] = 'Pending'
+from datetime import datetime
+from typing import Literal, Optional
 
-class ParticipantUpdate(BaseModel):
-    status: Literal['Approved', 'Pending']
+from pydantic import BaseModel, ConfigDict, Field
 
-class ParticipantResponse(BaseModel):
+from schemas.tournament import Person
+
+ParticipantStatus = Literal["pending", "approved", "rejected", "withdrawn"]
+
+
+class JoinIn(BaseModel):
+    # No user_id and no status. Who you are comes from your token; whether you
+    # are approved comes from the tournament's rules. The old endpoint took
+    # both from this body, so anyone could join as anyone and approve
+    # themselves.
+    model_config = ConfigDict(extra="forbid")
+    code: Optional[str] = Field(None, max_length=12)
+    invite: Optional[str] = Field(None, max_length=64)
+
+
+class ParticipantOut(BaseModel):
     id: str
     tournament_id: str
     user_id: str
-    email: str
-    status: str
-    created_at: Optional[str] = None
+    status: ParticipantStatus
+    rating_at_entry: Optional[int] = None
+    seed: Optional[int] = None
+    joined_via: Literal["open", "code", "invite", "added"]
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    created_at: datetime
+    profile: Optional[Person] = None
 
-    model_config = ConfigDict(from_attributes=True)
 
-class InviteRequest(BaseModel):
-    email: str
-    tournament_id: str
-    invite_link: str
+class RosterEntry(BaseModel):
+    """The public view of an entrant: approved, with a name and no email."""
+
+    participant_id: str
+    user_id: str
+    display_name: Optional[str] = None
+    username: Optional[str] = None
+    avatar_url: Optional[str] = None
+    country: Optional[str] = None
+    rating_at_entry: Optional[int] = None
+    seed: Optional[int] = None
+    joined_at: datetime

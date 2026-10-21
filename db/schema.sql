@@ -534,8 +534,12 @@ end $$;
 -- A tournament by slug: the read path for unlisted events, and the one the
 -- public page uses for all of them. Published events to anyone who has the
 -- link; drafts to their staff.
+-- setof, so "not found" reaches PostgREST as [] rather than a row of nulls.
+-- Dropped first because CREATE OR REPLACE cannot change a return type, and an
+-- earlier apply may have created the single-row version.
+drop function if exists public.get_tournament(text);
 create or replace function public.get_tournament(p_slug text)
-returns public.tournaments
+returns setof public.tournaments
 language sql stable security definer set search_path = public, extensions as $$
   select t.* from tournaments t
    where t.slug = p_slug

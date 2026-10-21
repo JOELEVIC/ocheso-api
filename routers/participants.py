@@ -1,94 +1,78 @@
-from fastapi import APIRouter, HTTPException, Header, Depends, Query
-from database import supabase
-from schemas.participant import ParticipantCreate, ParticipantUpdate, ParticipantResponse, InviteRequest
-from typing import List, Optional
+"""
+Entering, leaving, and the organiser deciding who is in.
 
-router = APIRouter(tags=["Participants & Invites (/rest/v1/participants)"])
+There is no endpoint that writes a participant row directly, because there is
+no way to in the database either: join_tournament() is the only door, and it
+takes who you are from your token. The old POST /rest/v1/participants accepted
+user_id and status in the body.
+"""
 
-def get_authenticated_user_id(authorization: str = Header(None)) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = authorization.split(" ")[1]
-    try:
-        user_response = supabase.auth.get_user(token)
-        if not user_response or not user_response.user:
-            raise HTTPException(status_code=401, detail="Authentication failed")
-        return user_response.user.id
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+from __future__ import annotations
 
-@router.post("/rest/v1/participants", response_model=ParticipantResponse, summary="Add Participant", description="Register a participant for a tournament with status ('Approved' | 'Pending').")
-def create_participant(
-    payload: ParticipantCreate,
-    user_id: str = Depends(get_authenticated_user_id)
-):
-    try:
-        data = payload.model_dump()
-        response = supabase.table("participants").insert(data).execute()
-        if not response.data:
-            raise HTTPException(status_code=400, detail="Failed to add participant")
-        return response.data[0]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+from fastapi import APIRouter, HTTPException, Response
 
-@router.get("/rest/v1/participants", response_model=List[ParticipantResponse], summary="Get Participant Roster", description="Retrieve participant roster feed filtered by ?tournament_id=eq.{tournament_id}.")
-def get_participants(
-    tournament_id: Optional[str] = Query(None, description="Filter by eq.{tournament_id}"),
-    select: str = Query("*", description="Columns to select")
-):
-    try:
-        query = supabase.table("participants").select(select)
-        if tournament_id:
-            clean_tid = tournament_id.replace("eq.", "") if "eq." in tournament_id else tournament_id
-            query = query.eq("tournament_id", clean_tid)
-        response = query.execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+from db import CallerDb, UserDb, one, rows
+from routers.tournaments import find
+from schemas.participant import JoinIn, ParticipantOut, RosterEntry
 
-@router.patch("/rest/v1/participants", summary="Update Participant Status", description="Approve or update participant status (e.g. status: 'Approved') filtered by ?id=eq.{participant_id}.")
-def patch_participant(
-    payload: ParticipantUpdate,
-    id: Optional[str] = Query(None, description="Filter by eq.{participant_id}"),
-    user_id: str = Depends(get_authenticated_user_id)
-):
-    if not id:
-        raise HTTPException(status_code=400, detail="Missing id query parameter")
-    clean_id = id.replace("eq.", "") if "eq." in id else id
-    try:
-        update_data = payload.model_dump()
-        response = supabase.table("participants").update(update_data).eq("id", clean_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Participant not found or update failed")
-        return response.data[0]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+router = APIRouter(tags=["Participants"])
 
-@router.delete("/rest/v1/participants", summary="Remove Participant", description="Remove participant from roster filtered by ?id=eq.{participant_id}.")
-def delete_participant(
-    id: Optional[str] = Query(None, description="Filter by eq.{participant_id}"),
-    user_id: str = Depends(get_authenticated_user_id)
-):
-    if not id:
-        raise HTTPException(status_code=400, detail="Missing id query parameter")
-    clean_id = id.replace("eq.", "") if "eq." in id else id
-    try:
-        response = supabase.table("participants").delete().eq("id", clean_id).execute()
-        return {"message": "Participant removed successfully", "data": response.data}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# participants has two keys into profiles (user_id, decided_by); PostgREST needs
+# to be told which one carries the player's name.
+WITH_PROFILE = "*, profile:profiles!participants_user_id_fkey(id,username,display_name,avatar_url,country)"
 
-@router.post("/functions/v1/send-invite", summary="Send Tournament Invite", description="Dispatch tournament email invite via Supabase Edge Function simulation.")
-def send_invite(
-    payload: InviteRequest,
-    user_id: str = Depends(get_authenticated_user_id)
-):
-    try:
-        return {
-            "status": "success",
-            "message": f"Invite successfully dispatched to {payload.email}",
-            "tournament_id": payload.tournament_id,
-            "invite_link": payload.invite_link
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/v1/tournaments/{slug}/roster", response_model=list[RosterEntry], summary="Who is playing")
+def roster(slug: str, db: CallerDb):
+    # Approved entrants with names, honouring the organiser's
+    # participants_visible switch - which staff and entrants see past.
+    find(db, slug)
+    return rows(db.rpc("get_roster", {"p_slug": slug}).execute())
+
+
+@router.get(
+    "/v1/tournaments/{slug}/participants",
+    response_model=list[ParticipantOut],
+    summary="Every entry, including those awaiting approval",
+)
+def entries(slug: str, db: UserDb):
+    # Staff see the whole roster; anyone else sees only their own row. That is
+    # RLS's call, so a stranger gets [] here rather than a 403.
+    t = find(db, slug)
+    return rows(
+        db.table("participants").select(WITH_PROFILE).eq("tournament_id", t["id"]).order("created_at").execute()
+    )
+
+
+@router.post("/v1/tournaments/{slug}/join", response_model=ParticipantOut, summary="Enter a tournament")
+def join(slug: str, body: JoinIn, db: UserDb):
+    # Approved straight away for an open event or an invite link; pending when
+    # the organiser approves entries. Joining twice returns the existing entry.
+    return one(
+        db.rpc("join_tournament", {"p_slug": slug, "p_code": body.code, "p_invite": body.invite}).execute()
+    )
+
+
+@router.post("/v1/tournaments/{slug}/withdraw", response_model=ParticipantOut, summary="Withdraw before the start")
+def withdraw(slug: str, db: UserDb):
+    return one(db.rpc("withdraw_from_tournament", {"p_slug": slug}).execute())
+
+
+@router.post("/v1/participants/{participant_id}/approve", response_model=ParticipantOut, summary="Approve an entry")
+def approve(participant_id: str, db: UserDb):
+    # Through decide_participant() so capacity is checked at the moment of
+    # approval - the same cap joining enforces.
+    return one(db.rpc("decide_participant", {"p_participant": participant_id, "p_status": "approved"}).execute())
+
+
+@router.post("/v1/participants/{participant_id}/reject", response_model=ParticipantOut, summary="Reject an entry")
+def reject(participant_id: str, db: UserDb):
+    return one(db.rpc("decide_participant", {"p_participant": participant_id, "p_status": "rejected"}).execute())
+
+
+@router.delete("/v1/participants/{participant_id}", status_code=204, summary="Remove an entrant")
+def remove(participant_id: str, db: UserDb):
+    gone = rows(db.table("participants").delete().eq("id", participant_id).execute())
+    if not gone:
+        raise HTTPException(status_code=404, detail="No such entry, or you don't run that tournament.")
+    return Response(status_code=204)

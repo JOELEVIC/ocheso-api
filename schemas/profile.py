@@ -1,26 +1,28 @@
-from pydantic import BaseModel, ConfigDict
+from __future__ import annotations
+
+from datetime import datetime
 from typing import Optional
 
-class ProfileBase(BaseModel):
-    username: Optional[str] = None
-    email: Optional[str] = None
-    full_name: Optional[str] = None
-    chess_rating: int = 1200
-    checkers_rating: int = 1200
-    avatar_url: Optional[str] = None
+from pydantic import BaseModel, ConfigDict, Field
 
-class ProfileCreate(ProfileBase):
-    id: str  # auth user id
+
+class ProfileOut(BaseModel):
+    id: str
+    username: Optional[str] = None
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    country: Optional[str] = None
+    chess_rating: int
+    checkers_rating: int
+    created_at: datetime
+    updated_at: datetime
+
 
 class ProfileUpdate(BaseModel):
-    username: Optional[str] = None
-    full_name: Optional[str] = None
-    chess_rating: Optional[int] = None
-    checkers_rating: Optional[int] = None
-    avatar_url: Optional[str] = None
-
-class ProfileResponse(ProfileBase):
-    id: str
-    updated_at: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
+    # No ratings. They are earned in rated games, not typed in - the old model
+    # let anyone set their own.
+    model_config = ConfigDict(extra="forbid")
+    username: Optional[str] = Field(None, pattern=r"^[a-z0-9_]{3,24}$")
+    display_name: Optional[str] = Field(None, min_length=1, max_length=60)
+    avatar_url: Optional[str] = Field(None, max_length=500)
+    country: Optional[str] = Field(None, pattern=r"^[A-Z]{2}$")
