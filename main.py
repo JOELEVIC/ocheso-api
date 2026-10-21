@@ -26,7 +26,7 @@ from postgrest import APIError
 
 from config import settings
 from db import fail
-from routers import participants, profiles, staff, tournaments
+from routers import participants, play, profiles, staff, tournaments
 
 app = FastAPI(
     title="Ocheso API",
@@ -60,6 +60,7 @@ app.include_router(tournaments.router)
 app.include_router(participants.router)
 app.include_router(staff.router)
 app.include_router(profiles.router)
+app.include_router(play.router)
 
 
 @app.get("/", tags=["Health"], include_in_schema=False)
