@@ -88,7 +88,9 @@ create table if not exists public.tournaments (
   slug                 text not null unique check (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and char_length(slug) <= 72),
   -- Defaults to the caller and cannot be updated (see grants). Nobody creates a
   -- tournament on somebody else's behalf, and nobody takes one over by PATCH.
-  owner_id             uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  -- References profiles rather than auth.users so PostgREST can embed the
+  -- owner's name along this key; profiles itself cascades from auth.users.
+  owner_id             uuid not null default auth.uid() references public.profiles (id) on delete cascade,
 
   title                text not null check (char_length(title) between 3 and 120),
   description          text check (char_length(description) <= 2000),
@@ -168,9 +170,9 @@ create table if not exists public.tournament_secrets (
 create table if not exists public.tournament_admins (
   id            uuid primary key default gen_random_uuid(),
   tournament_id uuid not null references public.tournaments (id) on delete cascade,
-  user_id       uuid not null references auth.users (id) on delete cascade,
+  user_id       uuid not null references public.profiles (id) on delete cascade,
   role          public.admin_role not null default 'moderator',
-  added_by      uuid not null default auth.uid() references auth.users (id),
+  added_by      uuid not null default auth.uid() references public.profiles (id),
   created_at    timestamptz not null default now(),
   unique (tournament_id, user_id)
 );
@@ -183,14 +185,14 @@ create index if not exists tournament_admins_user_idx on public.tournament_admin
 create table if not exists public.participants (
   id              uuid primary key default gen_random_uuid(),
   tournament_id   uuid not null references public.tournaments (id) on delete cascade,
-  user_id         uuid not null references auth.users (id) on delete cascade,
+  user_id         uuid not null references public.profiles (id) on delete cascade,
   status          public.participant_status not null default 'pending',
   -- Snapshotted at entry, so seeding and pairing use the rating the player had
   -- when they joined, not one that moves under the event while it runs.
   rating_at_entry int,
   seed            int check (seed >= 1),
   joined_via      text not null default 'open' check (joined_via in ('open', 'code', 'invite', 'added')),
-  decided_by      uuid references auth.users (id),
+  decided_by      uuid references public.profiles (id),
   decided_at      timestamptz,
   created_at      timestamptz not null default now(),
   unique (tournament_id, user_id)
@@ -202,18 +204,26 @@ create index if not exists participants_tournament_status_idx on public.particip
 -- =============================================================================
 -- Role checks
 -- =============================================================================
+-- In a `private` schema, not `public`. RLS policies evaluate as the caller, so
+-- the caller needs EXECUTE on these - which, in `public`, would also publish
+-- each one as a PostgREST RPC endpoint anyone could call. Supabase exposes only
+-- `public` over the API, so here they are usable by policies and unreachable
+-- from outside.
+create schema if not exists private;
+grant usage on schema private to anon, authenticated;
+
 -- SECURITY DEFINER, so a policy on tournaments can ask about tournament_admins
 -- without that table's own policies being evaluated recursively. Each answers
 -- one question about auth.uid() and nothing else, which is what makes it safe
 -- to let them step around RLS.
 
-create or replace function public.is_tournament_owner(t uuid)
+create or replace function private.is_tournament_owner(t uuid)
 returns boolean language sql stable security definer set search_path = public, extensions as $$
   select exists (select 1 from tournaments where id = t and owner_id = auth.uid());
 $$;
 
 -- Owner or co-admin: may change settings, see secrets, manage the roster.
-create or replace function public.is_tournament_manager(t uuid)
+create or replace function private.is_tournament_manager(t uuid)
 returns boolean language sql stable security definer set search_path = public, extensions as $$
   select exists (select 1 from tournaments where id = t and owner_id = auth.uid())
       or exists (select 1 from tournament_admins
@@ -221,13 +231,13 @@ returns boolean language sql stable security definer set search_path = public, e
 $$;
 
 -- Any staff, moderators included: may see the full roster and decide entries.
-create or replace function public.is_tournament_staff(t uuid)
+create or replace function private.is_tournament_staff(t uuid)
 returns boolean language sql stable security definer set search_path = public, extensions as $$
   select exists (select 1 from tournaments where id = t and owner_id = auth.uid())
       or exists (select 1 from tournament_admins where tournament_id = t and user_id = auth.uid());
 $$;
 
-create or replace function public.is_tournament_participant(t uuid)
+create or replace function private.is_tournament_participant(t uuid)
 returns boolean language sql stable security definer set search_path = public, extensions as $$
   select exists (select 1 from participants
                   where tournament_id = t and user_id = auth.uid() and status in ('pending', 'approved'));
@@ -236,7 +246,7 @@ $$;
 -- Whether a tournament's approved roster is public. Listed events only: the
 -- roster of an unlisted event would otherwise name it to anyone who listed
 -- participants, defeating the point of not listing it.
-create or replace function public.roster_is_public(t uuid)
+create or replace function private.roster_is_public(t uuid)
 returns boolean language sql stable security definer set search_path = public, extensions as $$
   select exists (select 1 from tournaments
                   where id = t and is_listed and participants_visible and status <> 'draft');
@@ -266,10 +276,22 @@ create trigger tournaments_touch before update on public.tournaments
 -- transaction, as a role with no rights on public.profiles.
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public, extensions as $$
+declare
+  base text;
 begin
-  insert into profiles (id, display_name, avatar_url)
+  -- A username from the email's local part, with a random tail so two "joel"s
+  -- never collide. Everyone gets one so organisers can add staff by name -
+  -- looking people up by email instead would need a function that confirms
+  -- whether an address has an account, which is a user-enumeration oracle.
+  base := left(regexp_replace(lower(split_part(coalesce(new.email, ''), '@', 1)), '[^a-z0-9_]+', '', 'g'), 16);
+  if char_length(base) < 3 then
+    base := 'player';
+  end if;
+
+  insert into profiles (id, username, display_name, avatar_url)
   values (
     new.id,
+    base || '_' || substr(encode(extensions.gen_random_bytes(3), 'hex'), 1, 5),
     nullif(left(coalesce(new.raw_user_meta_data ->> 'full_name',
                          new.raw_user_meta_data ->> 'name',
                          split_part(new.email, '@', 1)), 60), ''),
@@ -470,7 +492,7 @@ begin
   end if;
 
   select * into row from participants where id = p_participant;
-  if not found or not is_tournament_staff(row.tournament_id) then
+  if not found or not private.is_tournament_staff(row.tournament_id) then
     -- The same answer for "no such entry" and "not yours", so this cannot be
     -- used to probe for entries in tournaments you do not run.
     raise exception 'no such entry' using errcode = 'no_data_found';
@@ -502,7 +524,7 @@ language plpgsql security definer set search_path = public, extensions as $$
 declare
   row tournaments;
 begin
-  if not is_tournament_manager(p_tournament) then
+  if not private.is_tournament_manager(p_tournament) then
     raise exception 'no such tournament' using errcode = 'no_data_found';
   end if;
   update tournaments set status = p_status where id = p_tournament returning * into row;
@@ -517,7 +539,7 @@ returns public.tournaments
 language sql stable security definer set search_path = public, extensions as $$
   select t.* from tournaments t
    where t.slug = p_slug
-     and (t.status <> 'draft' or is_tournament_staff(t.id) or is_tournament_participant(t.id));
+     and (t.status <> 'draft' or private.is_tournament_staff(t.id) or private.is_tournament_participant(t.id));
 $$;
 
 -- The approved roster by slug, with names. Same visibility rule as
@@ -544,10 +566,33 @@ language sql stable security definer set search_path = public, extensions as $$
    where t.slug = p_slug
      and (
        (t.status <> 'draft' and t.participants_visible)
-       or is_tournament_staff(t.id)
-       or is_tournament_participant(t.id)
+       or private.is_tournament_staff(t.id)
+       or private.is_tournament_participant(t.id)
      )
    order by p.seed nulls last, p.rating_at_entry desc nulls last, p.created_at;
+$$;
+
+-- The caller's own profile. A function because PostgREST cannot filter on
+-- auth.uid(); SECURITY INVOKER, so RLS still applies inside it.
+create or replace function public.me()
+returns public.profiles
+language sql stable security invoker set search_path = public, extensions as $$
+  select * from profiles where id = auth.uid();
+$$;
+
+-- Everything the caller runs or plays in, with the part they play. INVOKER:
+-- it can only return what the read policies already let them see.
+create or replace function public.my_tournaments()
+returns table (tournament public.tournaments, my_role text)
+language sql stable security invoker set search_path = public, extensions as $$
+  select t, 'owner' from tournaments t where t.owner_id = auth.uid()
+  union all
+  select t, a.role::text from tournaments t
+    join tournament_admins a on a.tournament_id = t.id and a.user_id = auth.uid()
+  union all
+  select t, 'participant' from tournaments t
+    join participants p on p.tournament_id = t.id and p.user_id = auth.uid()
+   where p.status in ('pending', 'approved');
 $$;
 
 -- A new invite link, invalidating the old one: the remedy when a link has been
@@ -558,7 +603,7 @@ language plpgsql security definer set search_path = public, extensions as $$
 declare
   token text;
 begin
-  if not is_tournament_manager(p_tournament) then
+  if not private.is_tournament_manager(p_tournament) then
     raise exception 'no such tournament' using errcode = 'no_data_found';
   end if;
   update tournament_secrets
@@ -595,8 +640,8 @@ drop policy if exists tournaments_read on public.tournaments;
 create policy tournaments_read on public.tournaments for select to anon, authenticated using (
   owner_id = auth.uid()
   or (status <> 'draft' and is_listed)
-  or is_tournament_staff(id)
-  or is_tournament_participant(id)
+  or private.is_tournament_staff(id)
+  or private.is_tournament_participant(id)
 );
 -- Unlisted events are deliberately absent from this policy. "Unlisted" has to
 -- mean reachable-by-link, like an unlisted video - and a policy that let anyone
@@ -609,7 +654,7 @@ create policy tournaments_insert on public.tournaments for insert to authenticat
   with check (owner_id = auth.uid());
 drop policy if exists tournaments_update on public.tournaments;
 create policy tournaments_update on public.tournaments for update to authenticated
-  using (is_tournament_manager(id)) with check (is_tournament_manager(id));
+  using (private.is_tournament_manager(id)) with check (private.is_tournament_manager(id));
 drop policy if exists tournaments_delete on public.tournaments;
 create policy tournaments_delete on public.tournaments for delete to authenticated
   using (owner_id = auth.uid() and status = 'draft');
@@ -617,26 +662,26 @@ create policy tournaments_delete on public.tournaments for delete to authenticat
 -- Secrets: organisers only, in both directions.
 drop policy if exists secrets_read on public.tournament_secrets;
 create policy secrets_read on public.tournament_secrets for select to authenticated
-  using (is_tournament_manager(tournament_id));
+  using (private.is_tournament_manager(tournament_id));
 drop policy if exists secrets_update on public.tournament_secrets;
 create policy secrets_update on public.tournament_secrets for update to authenticated
-  using (is_tournament_manager(tournament_id)) with check (is_tournament_manager(tournament_id));
+  using (private.is_tournament_manager(tournament_id)) with check (private.is_tournament_manager(tournament_id));
 
 -- Staff: visible to staff; appointed and removed by the owner alone. A co-admin
 -- who could appoint co-admins could appoint a whole second team, and the owner
 -- would find out from the roster.
 drop policy if exists admins_read on public.tournament_admins;
 create policy admins_read on public.tournament_admins for select to authenticated
-  using (is_tournament_staff(tournament_id));
+  using (private.is_tournament_staff(tournament_id));
 drop policy if exists admins_insert on public.tournament_admins;
 create policy admins_insert on public.tournament_admins for insert to authenticated
-  with check (is_tournament_owner(tournament_id) and user_id <> auth.uid() and added_by = auth.uid());
+  with check (private.is_tournament_owner(tournament_id) and user_id <> auth.uid() and added_by = auth.uid());
 drop policy if exists admins_update on public.tournament_admins;
 create policy admins_update on public.tournament_admins for update to authenticated
-  using (is_tournament_owner(tournament_id)) with check (is_tournament_owner(tournament_id));
+  using (private.is_tournament_owner(tournament_id)) with check (private.is_tournament_owner(tournament_id));
 drop policy if exists admins_delete on public.tournament_admins;
 create policy admins_delete on public.tournament_admins for delete to authenticated
-  using (is_tournament_owner(tournament_id));
+  using (private.is_tournament_owner(tournament_id));
 
 -- Participants: approved entrants are public when the organiser allows it;
 -- staff see the whole roster; you always see your own row. NO insert policy -
@@ -644,12 +689,12 @@ create policy admins_delete on public.tournament_admins for delete to authentica
 drop policy if exists participants_read on public.participants;
 create policy participants_read on public.participants for select to anon, authenticated using (
   user_id = auth.uid()
-  or is_tournament_staff(tournament_id)
-  or (status = 'approved' and roster_is_public(tournament_id))
+  or private.is_tournament_staff(tournament_id)
+  or (status = 'approved' and private.roster_is_public(tournament_id))
 );
 drop policy if exists participants_delete on public.participants;
 create policy participants_delete on public.participants for delete to authenticated
-  using (is_tournament_manager(tournament_id));
+  using (private.is_tournament_manager(tournament_id));
 
 -- =============================================================================
 -- Grants
@@ -704,3 +749,11 @@ grant execute on function public.set_tournament_status(uuid, public.tournament_s
 -- visitor following a link.
 grant execute on function public.get_tournament(text) to anon, authenticated;
 grant execute on function public.get_roster(text) to anon, authenticated;
+
+-- Postgres grants EXECUTE to PUBLIC on every new function, and Supabase adds
+-- anon on top - so each of these is revoked before it is granted, or an
+-- anonymous visitor could call it.
+revoke all on function public.me() from public, anon;
+revoke all on function public.my_tournaments() from public, anon;
+grant execute on function public.me() to authenticated;
+grant execute on function public.my_tournaments() to authenticated;

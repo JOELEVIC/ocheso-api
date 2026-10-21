@@ -105,6 +105,28 @@ value(
 )
 
 # -----------------------------------------------------------------------------
+# What PostgREST can reach
+# -----------------------------------------------------------------------------
+# Supabase exposes the public schema as RPC. Role checks must not be in it.
+check(
+    "role-check helpers are not in public, so they are not API endpoints",
+    value("select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace "
+          "where n.nspname = 'public' and p.proname in ('is_tournament_owner', 'is_tournament_manager', "
+          "'is_tournament_staff', 'is_tournament_participant', 'roster_is_public')") == "0",
+)
+check(
+    "no public function an anonymous visitor can call except the two read paths",
+    value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
+          "join pg_namespace n on n.oid = p.pronamespace "
+          "where n.nspname = 'public' and p.prorettype <> 'trigger'::regtype "
+          "and has_function_privilege('anon', p.oid, 'execute')") == "get_roster,get_tournament",
+    value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
+          "join pg_namespace n on n.oid = p.pronamespace "
+          "where n.nspname = 'public' and p.prorettype <> 'trigger'::regtype "
+          "and has_function_privilege('anon', p.oid, 'execute')"),
+)
+
+# -----------------------------------------------------------------------------
 # Profiles
 # -----------------------------------------------------------------------------
 check(
@@ -138,6 +160,13 @@ no_effect(
     f"select display_name from profiles where id = '{STRANGER}'",
     "Sam Stranger",
 )
+
+check(
+    "every account is given a username, so staff can be added by name",
+    value(f"select username from profiles where id = '{PLAYER}'").startswith("player_"),
+)
+allowed("me() returns the caller's own profile", "select display_name from me()", PLAYER, "Pat P.")
+denied("me() is not available to anonymous visitors", "select * from me()", ANON)
 
 # -----------------------------------------------------------------------------
 # Creating a tournament
@@ -394,6 +423,14 @@ allowed("the owner starts the event", f"select status from set_tournament_status
 denied("nobody can withdraw once the event is live", f"select withdraw_from_tournament('{SLUG}')", PLAYER)
 denied("nobody can join once the event is live", f"select join_tournament('{SLUG}')", STRANGER)
 denied("a live event cannot go back to registration", f"select set_tournament_status('{TID}', 'registration')", OWNER)
+
+# -----------------------------------------------------------------------------
+# my_tournaments()
+# -----------------------------------------------------------------------------
+allowed("the owner's list names them owner", f"select my_role from my_tournaments() where (tournament).id = '{TID}'", OWNER, "owner")
+allowed("a co-admin's list names them co_admin", f"select my_role from my_tournaments() where (tournament).id = '{TID}'", COADMIN, "co_admin")
+allowed("a player's list names them participant", f"select my_role from my_tournaments() where (tournament).id = '{TID}'", PLAYER, "participant")
+allowed("a stranger's list does not include it", f"select count(*) from my_tournaments() where (tournament).id = '{TID}'", STRANGER, "0")
 
 # -----------------------------------------------------------------------------
 # Report
