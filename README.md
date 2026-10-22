@@ -114,31 +114,41 @@ async function ochesoApi(endpoint, options = {}) {
 
 ## 3. Local Development & Testing
 
-1. **Install Dependencies**:
+1. **Install everything both functions need, plus the server and tests**:
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements-dev.txt
    ```
 
-2. **Configure Environment Variables**:
-   Create a `.env` file based on `.env.example`:
-   ```env
-   SUPABASE_URL=https://ofjnhbkdqipqheyzdvym.supabase.co
-   SUPABASE_KEY=your-supabase-anon-key
+2. **Configure Environment Variables**: create `.env` from `.env.example`
+   (`SUPABASE_URL`, `SUPABASE_ANON_KEY` - the public key only - and
+   `REFEREE_SECRET`).
+
+3. **Run the whole API locally** (both functions in one process):
+   ```bash
+   uvicorn dev:app --reload --port 8000
    ```
 
-3. **Run the API Server Locally**:
+4. **Tests**:
    ```bash
-   uvicorn main:app --reload --port 8000
-   ```
-
-4. **Run Unit & Integration Tests**:
-   ```bash
-   PYTHONPATH=. pytest
+   pytest                      # unit tests (tests/)
+   db/test/e2e_play.sh         # tournaments end to end, local Postgres + PostgREST
+   db/test/e2e_agents.sh       # agents end to end, with the real engines
    ```
 
 ---
 
 ## 4. Deployment & Git
+
+Two Vercel functions in one project, one domain, both in `dub1` beside the
+database (`vercel.json`, Vercel Services):
+
+| Function | Serves | Root | Dependencies |
+|---|---|---|---|
+| `core` | everything else - tournaments, play, accounts | `core/` | `core/requirements.txt` |
+| `agents` | `/v1/agents`, `/v1/agent-keys`, `/v1/connect` | repository | `requirements.txt` (+ Stockfish in `agents/bin`, Maia in `agents/models/maia-npz`) |
+
+The agents function stays under Vercel's 225 MB so it ships whole: nothing is
+installed or downloaded at cold start. `tests/test_split.py` holds the split.
 
 - Repository: [https://github.com/JOELEVIC/ocheso-api](https://github.com/JOELEVIC/ocheso-api)
 - Domain: `api.ocheso.com`
