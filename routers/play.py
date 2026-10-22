@@ -362,6 +362,20 @@ def arena_join(slug: str, db: UserDb, authorization: Auth = None):
     waiting, you stay queued and the next player to arrive is paired with you."""
     me = caller_id(authorization)
     t = find(db, slug)
+    # Already paired - by whoever arrived after you - is the answer to "give
+    # me a game", not an error. Without this the player who waited was told to
+    # finish a game nobody had shown them.
+    current = rows(
+        db.table("games")
+        .select("*")
+        .eq("tournament_id", t["id"])
+        .neq("status", "finished")
+        .or_(f"white_id.eq.{me},black_id.eq.{me}")
+        .limit(1)
+        .execute()
+    )
+    if current:
+        return {"status": "paired", "game": current[0]}
     db.rpc("arena_join", {"p_tournament": t["id"]}).execute()
     waiting_ids = [q["user_id"] for q in rows(
         db.table("arena_queue").select("user_id,since").eq("tournament_id", t["id"]).order("since").execute()

@@ -234,7 +234,9 @@ first = expect("the first player waits", ar[0].post(f"/v1/tournaments/{slug}/are
 check("alone in the queue, you wait", first["status"] == "waiting")
 second = expect("the second player is paired at once", ar[1].post(f"/v1/tournaments/{slug}/arena/join"))
 check("paired with the one waiting", second["status"] == "paired" and {second["game"]["white_id"], second["game"]["black_id"]} == {ar[0].id, ar[1].id})
-expect("you cannot queue mid-game", ar[0].post(f"/v1/tournaments/{slug}/arena/join"), 409)
+mid = expect("asking again mid-game", ar[0].post(f"/v1/tournaments/{slug}/arena/join"))
+check("asking mid-game returns the game you are in, not a second one",
+      mid["status"] == "paired" and mid["game"]["id"] == second["game"]["id"])
 end = play_random(second["game"]["id"], people, rng)
 check("the arena game finishes", end["status"] == "finished")
 expect("the third player waits", ar[2].post(f"/v1/tournaments/{slug}/arena/join"))

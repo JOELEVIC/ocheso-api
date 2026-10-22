@@ -121,6 +121,8 @@ class TournamentOut(BaseModel):
     requires_code: bool
     auto_approve: bool
     status: Status
+    # When it actually went live (db/play.sql). Absent before play.sql is applied.
+    started_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
