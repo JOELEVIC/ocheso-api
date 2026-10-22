@@ -7,6 +7,7 @@ pydantic>=2.6.0
 pydantic-settings>=2.2.0
 python-dotenv>=1.0.1
 chess>=1.11.0
-# Maia's policy. Stockfish is a binary in agents/bin (agents/engines.py).
+# Maia's policy network runs on numpy (agents/maia_net.py); Stockfish is a
+# binary in agents/bin. No inference runtime: the function ships whole, with
+# nothing installed at cold start.
 numpy>=2.0
-onnxruntime>=1.20

@@ -1,5 +1,5 @@
 """
-Ocheso API - agents: the heavy function (Stockfish, Maia through onnxruntime).
+Ocheso API - agents: the heavy function (Stockfish, and Maia on numpy).
 
 Served on the same domain as the rest of the API: vercel.json sends
 /v1/agents, /v1/agent-keys and /v1/connect here and everything else to

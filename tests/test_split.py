@@ -1,6 +1,6 @@
 """
 The API is two Vercel functions on one domain (vercel.json): core/main.py, light,
-and agents_main.py, which alone carries Stockfish, Maia and onnxruntime. These
+and agents_main.py, which alone carries Stockfish, Maia and numpy. These
 hold the split: every route is served by exactly one of them, vercel.json sends
 each path to the function that has it, and the light one never imports what
 only agents need.
@@ -48,7 +48,8 @@ def test_vercel_routes_each_path_to_the_function_that_has_it():
         assert service_for(re.sub(r"\{[^}]+\}", "x", path)) == "core", path
     assert config["services"]["core"]["root"] == "core/"
     excluded = config["services"]["agents"]["functions"]["agents_main.py"]["excludeFiles"]
-    for heavy_only_in_tests in ("agents/golden/**", "agents/data/calibration/**", "tests/**", "core/.vercel/**"):
+    for heavy_only_in_tests in ("agents/golden/**", "agents/data/calibration/**", "agents/models/maia/**", "tests/**",
+                                "core/.vercel/**"):
         assert heavy_only_in_tests in excluded
 
 
@@ -73,8 +74,10 @@ def test_each_function_lists_only_what_it_imports():
 
     core, agents = names(ROOT / "core/requirements.txt"), names(ROOT / "requirements.txt")
     assert not {"numpy", "onnxruntime", "supabase", "pytest", "uvicorn"} & core
-    assert {"numpy", "onnxruntime", "chess", "postgrest"} <= agents
-    assert not {"networkx", "supabase", "pytest", "uvicorn"} & agents
+    assert {"numpy", "chess", "postgrest"} <= agents
+    # No inference runtime: under Vercel's 225 MB the function ships whole,
+    # nothing installed at cold start.
+    assert not {"onnxruntime", "networkx", "supabase", "pytest", "uvicorn"} & agents
     # The light code never imports anything the light function would be missing.
     for f in (ROOT / "core").rglob("*.py"):
         assert not re.search(r"^\s*(import|from) (numpy|onnxruntime|agents)\b", f.read_text(), re.M), f

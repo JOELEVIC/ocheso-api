@@ -24,7 +24,7 @@ from web import make_app
 
 # The light function. Agents (/v1/agents, /v1/agent-keys, /v1/connect) are a
 # separate one - agents_main.py at the repo root - so a tournament page never
-# loads Stockfish, Maia or onnxruntime. vercel.json routes between them.
+# loads Stockfish, Maia or numpy. vercel.json routes between them.
 app = make_app(
     title="Ocheso API",
     description=(

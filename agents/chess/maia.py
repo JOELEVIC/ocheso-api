@@ -5,7 +5,7 @@ Maia (CSSLab, GPL-3.0) is a set of Leela Chess Zero networks trained on
 millions of Lichess games, one per rating band 1100-1900. This module is the
 pure part: a position and its last moves into the 112 input planes lc0's
 "classical" networks read, and the 1858 policy outputs back into probabilities
-over the legal moves. Running the network is onnxruntime's job (engines.py).
+over the legal moves. Running the network is agents/maia_net.py's job (numpy).
 
 Encoding (lc0 INPUT_CLASSICAL_112_PLANE), from the side to move's point of view,
 the board mirrored when Black is to move: eight positions of history, newest

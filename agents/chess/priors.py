@@ -9,7 +9,8 @@ times are measured from 5.5 million rated games with clocks (think_v1.json).
 Below 800 the data is thin, so the 200 knot is v0's.
 
 v1 was fitted on what Stockfish 18 lite (WASM) and onnxruntime-web saw. The
-API runs native Stockfish 19 and onnxruntime, which see the same positions a
+API runs native Stockfish 19 and Maia natively (onnxruntime when v2 was fitted;
+numpy since, equal to float rounding - agents/maia_net.py), which see the same positions a
 little differently (sharper evaluations, so people's misjudgements need more
 perception noise to reproduce). v2 is v1 re-fitted on the same positions
 analysed by those engines (agents/calibration.py, the analyses in

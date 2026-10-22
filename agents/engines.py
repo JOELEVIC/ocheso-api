@@ -4,8 +4,9 @@ at this rating play".
 
 Stockfish runs as a UCI child process and is read the brain's way - every
 depth, every MultiPV line, indexed by move (the same parsing as calibration's).
-Maia runs through onnxruntime on the same ONNX weights calibration used, one
-session per rating band, loaded on first use.
+Maia runs on the same weights calibration used - extracted from its ONNX
+models and evaluated with numpy (agents/maia_net.py), one network per rating
+band, loaded on first use.
 
 Stockfish ships with the API: agents/bin/stockfish-linux-x86-64 is the
 official Stockfish 19 release for Linux x86-64 (the servers), checked against
@@ -15,7 +16,7 @@ waits. First found wins: STOCKFISH_PATH; the bundled binary, on a machine it
 runs on; `stockfish` on the PATH (development on a Mac). `Stockfish.name`
 says what is really running, and `health()` reports it and where it came from.
 
-Maia lives in MAIA_DIR (default: agents/models/maia, files maia-<band>.onnx).
+Maia lives in MAIA_DIR (default: agents/models/maia-npz, files maia-<band>.npz).
 If it is missing the brain falls back to its board heuristic - weaker, and
 reported as priorSource "heuristic" on every decision, so it never happens
 silently.
@@ -38,7 +39,7 @@ from typing import Optional
 
 from agents.chess.maia import MAIA_PLANES, maia_history, maia_input, maia_policy
 
-DEFAULT_MAIA_DIR = Path(__file__).parent / "models" / "maia"
+DEFAULT_MAIA_DIR = Path(__file__).parent / "models" / "maia-npz"
 
 # The engine the priors were fitted on, and the build that ships with the API.
 STOCKFISH_VERSION = "Stockfish 19"
@@ -290,33 +291,29 @@ class Stockfish:
 # Maia
 # -----------------------------------------------------------------------------
 class Maia:
-    """Maia's policy per band, through onnxruntime. Sessions load on first use."""
+    """Maia's policy per band, with numpy (agents/maia_net.py). Networks load on first use."""
 
     def __init__(self, directory: Optional[str] = None):
         self.dir = Path(directory or os.environ.get("MAIA_DIR") or DEFAULT_MAIA_DIR)
-        self.sessions: dict[int, object] = {}
+        self.nets: dict[int, object] = {}
         self.lock = threading.Lock()
 
     def available(self, band: int) -> bool:
-        return (self.dir / f"maia-{band}.onnx").exists()
+        return (self.dir / f"maia-{band}.npz").exists()
 
-    def _session(self, band: int):
+    def _net(self, band: int):
         with self.lock:
-            if band not in self.sessions:
-                import onnxruntime as ort
+            if band not in self.nets:
+                from agents.maia_net import MaiaNet
 
-                opts = ort.SessionOptions()
-                opts.intra_op_num_threads = 1
-                opts.inter_op_num_threads = 1
-                self.sessions[band] = ort.InferenceSession(str(self.dir / f"maia-{band}.onnx"), opts)
-            return self.sessions[band]
+                self.nets[band] = MaiaNet.load(self.dir / f"maia-{band}.npz")
+            return self.nets[band]
 
     def logits(self, fens: list[str], from_standard_start: bool, band: int) -> list[float]:
         import numpy as np
 
-        planes = np.asarray(maia_input(fens, from_standard_start), dtype=np.float32).reshape(1, MAIA_PLANES, 8, 8)
-        out = self._session(band).run(["/output/policy"], {"/input/planes": planes})  # type: ignore[attr-defined]
-        return out[0][0].tolist()
+        planes = np.asarray(maia_input(fens, from_standard_start), dtype=np.float32).reshape(MAIA_PLANES, 8, 8)
+        return self._net(band).policy_logits(planes).tolist()  # type: ignore[attr-defined]
 
     def policy(self, fen: str, history: list[str], band: int) -> Optional[dict[str, float]]:
         if not self.available(band):

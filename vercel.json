@@ -15,7 +15,7 @@
       "functions": {
         "agents_main.py": {
           "regions": ["dub1"],
-          "excludeFiles": "{core/.vercel/**,core/uv.lock,core/pyproject.toml,_uv/**,tests/**,db/**,agents/golden/**,agents/data/calibration/**,dev.py,**/.pytest_cache/**,.idea/**,.env*}"
+          "excludeFiles": "{core/.vercel/**,core/uv.lock,core/pyproject.toml,_uv/**,tests/**,db/**,agents/golden/**,agents/data/calibration/**,agents/models/maia/**,dev.py,**/.pytest_cache/**,.idea/**,.env*}"
         }
       }
     }
