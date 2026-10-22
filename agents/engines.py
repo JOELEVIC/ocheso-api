@@ -7,13 +7,13 @@ depth, every MultiPV line, indexed by move (the same parsing as calibration's).
 Maia runs through onnxruntime on the same ONNX weights calibration used, one
 session per rating band, loaded on first use.
 
-Where Stockfish comes from, first found wins: STOCKFISH_PATH; `stockfish` on
-the PATH; the official Stockfish 19 build for this machine, fetched once per
-instance into the temp directory and checked against its published SHA-256
-before it is unpacked (serverless hosts have no package manager, and a 100 MB
-binary has no place in git). The priors were fitted on Stockfish 19
-(agents/chess/priors.py): `Stockfish.name` says what is really running, and
-`health()` reports it.
+Stockfish ships with the API: agents/bin/stockfish-linux-x86-64 is the
+official Stockfish 19 release for Linux x86-64 (the servers), checked against
+its published SHA-256 and proven to search exactly as the engine calibration
+v2 was fitted on (agents/bin/README.md). Nothing is downloaded while a request
+waits. First found wins: STOCKFISH_PATH; the bundled binary, on a machine it
+runs on; `stockfish` on the PATH (development on a Mac). `Stockfish.name`
+says what is really running, and `health()` reports it and where it came from.
 
 Maia lives in MAIA_DIR (default: agents/models/maia, files maia-<band>.onnx).
 If it is missing the brain falls back to its board heuristic - weaker, and
@@ -40,86 +40,81 @@ from agents.chess.maia import MAIA_PLANES, maia_history, maia_input, maia_policy
 
 DEFAULT_MAIA_DIR = Path(__file__).parent / "models" / "maia"
 
-# The engine the priors were fitted on.
+# The engine the priors were fitted on, and the build that ships with the API.
 STOCKFISH_VERSION = "Stockfish 19"
-_RELEASE = "https://github.com/official-stockfish/Stockfish/releases/download/sf_19/"
-STOCKFISH_BUILDS = {
-    ("Linux", "x86_64"): (_RELEASE + "stockfish-linux-x86-64-universal.tar.gz",
-                          "9defc0d4e55d49c65a6d042f3e571a39fcea499ade6dbe741b53b8c65e03611f"),
-    ("Linux", "aarch64"): (_RELEASE + "stockfish-linux-arm64-universal.tar.gz",
-                           "fe26cfd1d9db4c8af3d21e24d9ff34cacb31c1f940085a7583da11796f2bac01"),
-    ("Darwin", "arm64"): (_RELEASE + "stockfish-macos-universal.tar.gz", None),
+BUNDLED_DIR = Path(__file__).parent / "bin"
+BUNDLED = {("Linux", "x86_64"): BUNDLED_DIR / "stockfish-linux-x86-64"}
+RELEASE = {
+    "url": "https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz",
+    "archive_sha256": "9defc0d4e55d49c65a6d042f3e571a39fcea499ade6dbe741b53b8c65e03611f",
+    "member": "stockfish/stockfish-linux-x86-64-universal",
+    "binary_sha256": "0f83d24cc46d2c66c60f16001af5444873bc112b7d028594513426894c12da19",
 }
-_fetch_lock = threading.Lock()
+_copy_lock = threading.Lock()
 
 
-def stockfish_path(fetch: bool = True) -> Optional[str]:
+def stockfish_source() -> tuple[Optional[str], str]:
+    """Where Stockfish is, and how it was found: configured, bundled or path."""
     configured = os.environ.get("STOCKFISH_PATH")
     if configured:
-        return configured
-    found = shutil.which("stockfish")
-    if found or not fetch:
-        return found
-    return fetch_stockfish()
+        return configured, "configured"
+    bundled = BUNDLED.get((platform.system(), platform.machine()))
+    if bundled is not None and bundled.exists():
+        return _executable(bundled), "bundled"
+    return shutil.which("stockfish"), "path"
 
 
-def fetch_stockfish(directory: Optional[Path] = None) -> Optional[str]:
-    """The official build for this machine, downloaded and verified once."""
-    build = STOCKFISH_BUILDS.get((platform.system(), platform.machine()))
-    if not build or not build[1]:
-        return None
-    url, sha256 = build
-    home = directory or Path(tempfile.gettempdir()) / "ocheso-stockfish" / sha256[:16]
-    exe = home / "stockfish"
-    with _fetch_lock:
-        if exe.exists():
-            return str(exe)
-        home.mkdir(parents=True, exist_ok=True)
-        archive = home / "download.tar.gz"
+def stockfish_path() -> Optional[str]:
+    return stockfish_source()[0]
+
+
+def _executable(binary: Path) -> str:
+    """The bundled binary, runnable. Deploys that drop the execute bit get a copy
+    in the temp directory, made once per instance from the bundle - a local copy,
+    not a download. (Mode bits, not os.access: as root, on some mounts, access()
+    says yes and exec still refuses; Stockfish() retries with the copy then.)"""
+    if binary.stat().st_mode & 0o111:
+        return str(binary)
+    return _runnable_copy(binary)
+
+
+def _runnable_copy(binary: Path) -> str:
+    copy = Path(tempfile.gettempdir()) / "ocheso-stockfish" / binary.name
+    with _copy_lock:
+        if not copy.exists():
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            partial = copy.with_suffix(".partial")
+            shutil.copyfile(binary, partial)
+            partial.chmod(0o755)
+            partial.replace(copy)
+    return str(copy)
+
+
+def update_bundled(out: Path = BUNDLED["Linux", "x86_64"]) -> str:
+    """For maintainers: fetch the pinned release, verify archive and binary, and
+    write the bundled binary. Never called while serving.
+
+        python -m agents.engines update-bundled
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "release.tar.gz"
         digest = hashlib.sha256()
-        with urllib.request.urlopen(url, timeout=60) as r, open(archive, "wb") as f:  # noqa: S310 - pinned https URL
+        with urllib.request.urlopen(RELEASE["url"], timeout=120) as r, open(archive, "wb") as f:  # noqa: S310 - pinned https URL
             while chunk := r.read(1 << 20):
                 digest.update(chunk)
                 f.write(chunk)
-        if digest.hexdigest() != sha256:
-            archive.unlink(missing_ok=True)
-            raise RuntimeError(f"Stockfish download did not match its published SHA-256 ({url})")
-        unpacked = home / "unpacked"
+        if digest.hexdigest() != RELEASE["archive_sha256"]:
+            raise RuntimeError("the release archive does not match its published SHA-256")
         with tarfile.open(archive) as t:
-            t.extractall(unpacked, filter="data")
-        archive.unlink()
-        binary = _first_that_runs(unpacked)
-        if binary is None:
-            shutil.rmtree(unpacked, ignore_errors=True)
-            raise RuntimeError(f"No Stockfish binary in {url} runs on this machine")
-        partial = home / "stockfish.partial"
-        binary.replace(partial)
-        partial.replace(exe)
-        shutil.rmtree(unpacked, ignore_errors=True)
-        return str(exe)
-
-
-# The archive holds the binary (or one per instruction set) beside its sources.
-# Rather than guess which this CPU runs, try them, the likeliest first.
-_PREFERENCE = ("universal", "avx2", "bmi2", "sse41-popcnt", "x86-64", "armv8", "arm64")
-
-
-def _first_that_runs(root: Path) -> Optional[Path]:
-    files = [p for p in root.rglob("stockfish*") if p.is_file() and p.stat().st_size > 1_000_000]
-
-    def rank(p: Path) -> int:
-        name = p.name.lower()
-        return next((i for i, tag in enumerate(_PREFERENCE) if tag in name), len(_PREFERENCE))
-
-    for candidate in sorted(files, key=lambda p: (rank(p), -p.stat().st_size)):
-        candidate.chmod(0o755)
-        try:
-            out = subprocess.run([str(candidate)], input="uci\nquit\n", capture_output=True, text=True, timeout=20)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if "uciok" in out.stdout:
-            return candidate
-    return None
+            data = t.extractfile(t.getmember(RELEASE["member"])).read()  # type: ignore[union-attr]
+    if hashlib.sha256(data).hexdigest() != RELEASE["binary_sha256"]:
+        raise RuntimeError("the binary in the release is not the one that was tested")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    partial = out.with_suffix(".partial")
+    partial.write_bytes(data)
+    partial.chmod(0o755)
+    partial.replace(out)
+    return str(out)
 
 
 # -----------------------------------------------------------------------------
@@ -212,12 +207,18 @@ class Stockfish:
     """One Stockfish process, single-threaded, one search at a time."""
 
     def __init__(self, path: Optional[str] = None, hash_mb: int = 16, threads: int = 1):
-        exe = path or stockfish_path()
+        exe, self.source = (path, "given") if path else stockfish_source()
         if not exe:
             raise RuntimeError("Stockfish not found: set STOCKFISH_PATH")
-        self.proc = subprocess.Popen(
-            [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1
-        )
+        try:
+            self.proc = self._spawn(exe)
+        except PermissionError:
+            if self.source != "bundled":
+                raise
+            # The deploy kept the bytes but not the right to run them.
+            exe = _runnable_copy(Path(exe))
+            self.proc = self._spawn(exe)
+        self.path = exe
         self.lock = threading.Lock()
         self.name = ""
         self._send("uci")
@@ -231,6 +232,12 @@ class Stockfish:
         self._send(f"setoption name Threads value {threads}")
         self._send(f"setoption name Hash value {hash_mb}")
         self._ready()
+
+    @staticmethod
+    def _spawn(exe: str) -> subprocess.Popen:
+        return subprocess.Popen(
+            [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1
+        )
 
     def _send(self, line: str) -> None:
         assert self.proc.stdin is not None
@@ -334,3 +341,12 @@ class Engines:
 
     def policy(self, fen: str, history: list[str], band: int) -> Optional[dict[str, float]]:
         return self.maia.policy(fen, history, band) if self.maia else None
+
+
+if __name__ == "__main__":
+    import sys
+
+    if sys.argv[1:] == ["update-bundled"]:
+        print(update_bundled())
+    else:
+        print("usage: python -m agents.engines update-bundled")

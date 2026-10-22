@@ -1,0 +1,2 @@
+agents/bin/stockfish-* binary
+agents/models/**/*.onnx binary

@@ -66,7 +66,8 @@ def engines() -> Engines:
 def health() -> dict:
     try:
         e = engines()
-        sf = {"ok": True, "name": e.stockfish.name, "matchesCalibration": e.stockfish.matches_calibration}
+        sf = {"ok": True, "name": e.stockfish.name, "matchesCalibration": e.stockfish.matches_calibration,
+              "source": e.stockfish.source}
         maia = [b for b in range(PRIORS.maia_floor, PRIORS.maia_ceiling + 1, 100) if e.maia and e.maia.available(b)]
     except Exception as err:  # noqa: BLE001 - reported, not raised: this is the health check
         sf, maia = {"ok": False, "error": str(err)}, []
