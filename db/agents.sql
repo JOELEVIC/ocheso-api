@@ -321,12 +321,15 @@ end $$;
 -- -----------------------------------------------------------------------------
 -- The platform's side (signed by the API, for a key)
 -- -----------------------------------------------------------------------------
--- What a key may drive.
+-- What a key may drive. With `personas`, each agent's persona too - for the
+-- API's own use (presence, seats, challenge answers); the API never returns
+-- a persona to a platform.
 create or replace function public.agent_machine_key(p_payload text, p_sig text)
 returns jsonb language plpgsql security definer set search_path = public, extensions as $$
 declare
   body jsonb := private.machine_request(p_payload, p_sig, 'agent-key');
   k    public.agent_keys := private.key_by_hash(body ->> 'key');
+  with_persona boolean := coalesce((body ->> 'personas')::boolean, false);
 begin
   if (body ->> 'gauge')::boolean then
     perform private.count_usage(k.owner_id, '00000000-0000-0000-0000-000000000000', 0, 0, 1);
@@ -335,6 +338,8 @@ begin
     'key', jsonb_build_object('id', k.id, 'name', k.name, 'owner', k.owner_id),
     'agents', coalesce((select jsonb_agg(jsonb_build_object('id', a.id, 'name', a.name, 'game', a.game,
                                                               'rating', a.rating, 'status', a.status)
+                                          || case when with_persona then jsonb_build_object('persona', a.persona)
+                                                  else '{}'::jsonb end
                                           order by a.created_at)
                           from public.agents a
                          where a.owner_id = k.owner_id
@@ -361,6 +366,16 @@ declare
   a    public.agents := private.agent_for_key(k, (body ->> 'agent')::uuid);
   s    public.agent_sessions;
 begin
+  -- The same game asked for again (a platform's server restarted mid-game):
+  -- the session it already has, mood and all, not a second one.
+  if body ->> 'externalRef' is not null then
+    select * into s from public.agent_sessions
+     where owner_id = k.owner_id and agent_id = a.id and external_ref = body ->> 'externalRef' and status = 'live'
+     order by started_at desc limit 1;
+    if found then
+      return jsonb_build_object('session', private.session_json(s), 'agent', private.agent_json(a), 'resumed', true);
+    end if;
+  end if;
   if (select count(*) from public.agent_sessions
        where owner_id = k.owner_id and status = 'live' and started_at > now() - interval '1 day') >= 500 then
     raise exception 'too many live sessions; end some first' using errcode = '23514';

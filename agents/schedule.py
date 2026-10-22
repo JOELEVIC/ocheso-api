@@ -33,11 +33,21 @@ def _minutes_of(hhmm: str) -> int:
     return int(hhmm[0:2]) * 60 + int(hhmm[3:5])
 
 
+def _always(w: dict) -> bool:
+    """A window of the whole day at full presence: always around, no sessions or breaks.
+    Not something the TypeScript kit had; nothing calibrated uses it."""
+    return w["presence"] >= 1 and w["from"] == "00:00" and w["to"] in ("23:59", "24:00")
+
+
 def sessions_on(p: dict, seed: str, date: str, weekday: int) -> list[dict]:
     """The sessions a persona plays on a local date, in minutes after local midnight."""
     out: list[dict] = []
     for i, w in enumerate(p["life"]["weekly"]):
         if weekday not in w["days"]:
+            continue
+        if _always(w):
+            # The whole day, every time: an agent set to be around for testing.
+            out.append({"from": 0, "to": 24 * 60})
             continue
         rng = rng_from(f"{seed}/{date}/w{i}")
         if not rng.chance(w["presence"]):

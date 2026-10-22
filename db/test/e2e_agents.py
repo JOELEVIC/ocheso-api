@@ -120,6 +120,9 @@ s = expect("the platform seats Ama as White",
                                                              "opponent_rating": 1350, "external_ref": "e2e-1"}), 201)
 SID = s["session"]["id"]
 check("a sync session has no channel", "realtime" not in s["session"])
+again = expect("opening the same game again", api.post("/v1/connect/sessions", headers=H, json={
+    "agent": ama["id"], "color": "white", "cadence": "3+2", "opponent_rating": 1350, "external_ref": "e2e-1"}), 201)
+check("...returns the session it already has", again["session"]["id"] == SID and again["resumed"] is True, str(again)[:200])
 board = chess.Board()
 clock = 180_000
 said: list[str] = []
@@ -145,7 +148,9 @@ while plies < 80:
     if board.is_game_over():
         over = board.result()
         break
-check("the agent plays a whole game of legal moves", plies >= 10, f"{plies} plies, {over}")
+# Seeds come from the session id, so each run is a different game: it either
+# runs the 80 plies or ends properly (mate, resignation) on the way.
+check("the agent plays a whole game of legal moves", plies >= 10 or over is not None, f"{plies} plies, {over}")
 # The last request again (the platform's retry): the same answer, nothing recorded twice.
 # The agent (White) last asked with Black to move gone: one move back if it moved last, two if Black did.
 agent_last = len(board.move_stack) - (2 if board.turn == chess.WHITE else 1) if over != "resigned" else len(board.move_stack)
@@ -196,6 +201,47 @@ if sent:
     good = hmac.new(RT["secret"].encode(), json.dumps(data, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
     check("the payload verifies with the session secret", hmac.compare_digest(sent["sig"], good))
     check("...and carries the move", chess.Move.from_uci(data["move"]) in chess.Board().legal_moves and data["ply"] == 0)
+
+# The people around the agents: presence, seats, challenges, friend requests.
+pres = expect("the key sees who is online", api.get("/v1/connect/presence", headers=H))
+mine = [a for a in pres["agents"] if a["id"] == ama["id"]]
+check("...each agent with its cadences and either a session now or the next one",
+      len(mine) == 1 and mine[0]["cadences"] and (mine[0]["online"] or mine[0]["next_online"]), str(mine))
+check("...and personas never leave the API", all("persona" not in a for a in pres["agents"]))
+forced = expect("a platform testing can set the schedule aside", api.get("/v1/connect/presence?ignore_schedule=true", headers=H))
+check("...then an active agent is online", [a["online"] for a in forced["agents"] if a["id"] == ama["id"]] == [True])
+import time as _t
+now_ms = int(_t.time() * 1000)
+seek = {"id": "seek-e2e-1", "creator_id": "person-1", "creator_rating": 1450, "cadence": "5+0",
+        "created_at_ms": now_ms - 40_000, "heartbeat_at_ms": now_ms - 1_000}
+took = expect("a seek that waited 40 s with nobody else around",
+              api.post("/v1/connect/seat", headers=H, json={"seek": seek, "agents": [{"id": ama["id"], "idle": True}], "ignore_schedule": True}))
+check("...is taken by the agent", took == {"action": "take", "reason": None, "agent": ama["id"], "candidates": 1}, str(took))
+young = expect("a seek two seconds old", api.post("/v1/connect/seat", headers=H, json={
+    "seek": {**seek, "id": "seek-e2e-2", "created_at_ms": now_ms - 2_000}, "agents": [{"id": ama["id"], "idle": True}], "ignore_schedule": True}))
+check("...waits for a person first", young["action"] == "wait" and young["reason"] == "people-first-window" and young["retry_in_ms"] > 0, str(young))
+paired = expect("a seek another person could still pair with", api.post("/v1/connect/seat", headers=H, json={
+    "seek": {**seek, "id": "seek-e2e-3", "human_alternatives": 1}, "agents": [{"id": ama["id"], "idle": True}], "ignore_schedule": True}))
+check("...is left to people", paired["action"] == "wait" and paired["reason"] == "a-person-could-pair", str(paired))
+busy = expect("an agent already playing", api.post("/v1/connect/seat", headers=H, json={
+    "seek": {**seek, "id": "seek-e2e-4"}, "agents": [{"id": ama["id"], "idle": False}], "ignore_schedule": True}))
+check("...never takes a second game", busy["action"] == "wait" and busy["reason"] == "nobody-suitable", str(busy))
+foreign = expect("an agent the key does not cover", api.post("/v1/connect/seat", headers=H, json={
+    "seek": {**seek, "id": "seek-e2e-5"}, "agents": [{"id": copy["id"], "idle": True}], "ignore_schedule": True}))
+check("...is never seated", foreign["action"] == "wait", str(foreign))
+ch = expect("a person challenges the agent at its cadence", api.post(f"/v1/connect/agents/{ama['id']}/challenge", headers=H, json={
+    "challenge_id": "ch-1", "challenger_rating": 1450, "cadence": "5+0", "ignore_schedule": True}))
+check("...it accepts, a beat later", ch["action"] == "accept" and 4_000 <= ch["after_ms"] <= 20_000, str(ch))
+ch2 = expect("...and at a cadence it doesn't play", api.post(f"/v1/connect/agents/{ama['id']}/challenge", headers=H, json={
+    "challenge_id": "ch-2", "challenger_rating": 1450, "cadence": "1+0", "ignore_schedule": True}))
+check("...it declines or lets it sit", ch2["action"] in ("decline", "ignore"), str(ch2))
+ch3 = expect("...or while in a game", api.post(f"/v1/connect/agents/{ama['id']}/challenge", headers=H, json={
+    "challenge_id": "ch-3", "challenger_rating": 1450, "cadence": "5+0", "idle": False, "ignore_schedule": True}))
+check("...it lets it sit", ch3["action"] == "ignore", str(ch3))
+fr = expect("a friend request", api.post(f"/v1/connect/agents/{ama['id']}/friend-request", headers=H, json={"request_id": "fr-1"}))
+check("...is answered later, not at once", isinstance(fr["accept"], bool) and fr["after_ms"] >= 60_000, str(fr))
+expect("an agent outside the key cannot be challenged", api.post(f"/v1/connect/agents/{copy['id']}/challenge", headers=H, json={
+    "challenge_id": "ch-4", "challenger_rating": 1450, "cadence": "5+0"}), 404)
 
 # The owner's controls bite at once.
 expect("the owner pauses Ama", owner.patch(f"/v1/agents/{ama['id']}", {"status": "paused"}))

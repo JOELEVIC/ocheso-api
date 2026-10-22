@@ -27,13 +27,16 @@ import hmac
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
-from agents import service
+from agents import dispatch, schedule, service
+from agents.rng import rng_from
 from agents.persona import PersonaError
 from config import settings
 from db import anon_db, one
@@ -52,7 +55,8 @@ class OpenIn(BaseModel):
     cadence: str = Field("10+0", pattern=r"^\d{1,3}\+\d{1,3}$")
     opponent_rating: Optional[int] = Field(None, ge=100, le=3500)
     realtime: bool = False
-    # Your own game id, so you can find the session again.
+    # Your own game id. Opening again with the same one returns the live
+    # session it already has (after a restart on your side), mood and all.
     external_ref: Optional[str] = Field(None, max_length=120)
     # Games this agent already played in this sitting: it tires.
     games_this_session: int = Field(0, ge=0, le=50)
@@ -211,7 +215,9 @@ def open_session(body: OpenIn, authorization: KeyHeader = None, x_ocheso_key: Al
         "externalRef": body.external_ref, "state": {"gamesThisSession": body.games_this_session},
     })
     return {"session": session_out(opened["session"]),
-            "agent": {k: opened["agent"][k] for k in ("id", "name", "game", "rating")}}
+            "agent": {k: opened["agent"][k] for k in ("id", "name", "game", "rating")},
+            # True when this game already had a live session (same external_ref): it carries on.
+            "resumed": bool(opened.get("resumed"))}
 
 
 @router.post("/sessions/{session_id}/move", summary="The agent's move")
@@ -285,3 +291,190 @@ async def key_difficulty(body: DifficultyIn, authorization: KeyHeader = None, x_
     await acall("agent-key", "agent_machine_key", {"key": key, "gauge": True})
     return await decide_off_loop(service.difficulty, sp, ratings=body.ratings, cadence=body.cadence,
                                  clock_ms=body.clock_ms, samples=body.samples)
+
+
+# -----------------------------------------------------------------------------
+# A platform's people around the agents: who is online, seats, challenges,
+# friend requests. The agents' lives (agents/schedule.py) and the rules that
+# keep people first (agents/dispatch.py) decide here; the platform gathers the
+# facts and acts. Agents never start contact: there is no route for an agent
+# to challenge or befriend anyone.
+# -----------------------------------------------------------------------------
+class SeekIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=120)
+    creator_id: str = Field(min_length=1, max_length=120)
+    creator_rating: int = Field(ge=0, le=3500)
+    cadence: str = Field(pattern=r"^\d{1,3}\+\d{1,3}$")
+    created_at_ms: int = Field(ge=0)
+    heartbeat_at_ms: int = Field(ge=0)
+    is_position: bool = False
+    # Other people's open seeks this one could still be paired with, by the
+    # platform's own pairing rules: while there are any, no agent steps in.
+    human_alternatives: int = Field(0, ge=0)
+
+
+class SeatAgentIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    idle: bool
+    # Games against each person in the last week, so the same agent rarely meets them twice running.
+    recent_opponents: dict[str, int] = Field(default_factory=dict)
+
+
+class DispatchIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    wait_min_ms: Optional[int] = Field(None, ge=3_000, le=40_000)
+    wait_max_ms: Optional[int] = Field(None, ge=3_000, le=44_000)
+    max_heartbeat_age_ms: Optional[int] = Field(None, ge=5_000, le=60_000)
+    repeat_penalty: Optional[float] = Field(None, ge=0, le=20)
+    cadences: Optional[list[str]] = Field(None, max_length=40)
+    # The platform's own pairing window, so an agent is never a closer match than a person would have been.
+    rating_window: Optional[dict[str, int]] = None
+
+    def to_settings(self) -> dict:
+        names = {"wait_min_ms": "waitMinMs", "wait_max_ms": "waitMaxMs", "max_heartbeat_age_ms": "maxHeartbeatAgeMs",
+                 "repeat_penalty": "repeatPenalty", "cadences": "cadences", "rating_window": "ratingWindow"}
+        out = {}
+        for k, v in self.model_dump(exclude_none=True).items():
+            if k == "rating_window":
+                v = {{"start": "start", "step": "step", "step_ms": "stepMs", "anyone_after_ms": "anyoneAfterMs"}.get(a, a): b
+                     for a, b in v.items()}
+            out[names[k]] = v
+        return out
+
+
+class SeatIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    seek: SeekIn
+    agents: list[SeatAgentIn] = Field(max_length=200)
+    settings: Optional[DispatchIn] = None
+    # The schedule is the agent's life; a platform testing its integration may set it aside.
+    ignore_schedule: bool = False
+
+
+class ChallengeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    challenge_id: str = Field(min_length=1, max_length=120)
+    challenger_rating: int = Field(ge=0, le=3500)
+    cadence: str = Field(pattern=r"^\d{1,3}\+\d{1,3}$")
+    rated: bool = True
+    is_position: bool = False
+    # Whether the agent is free right now (no game in progress) - the platform knows.
+    idle: bool = True
+    settings: Optional[DispatchIn] = None
+    ignore_schedule: bool = False
+
+
+class FriendIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(min_length=1, max_length=120)
+
+
+def roster(key: str) -> dict[str, dict]:
+    """The key's agents, with personas, as the API's own working copy."""
+    got = call("agent-key", "agent_machine_key", {"key": key, "personas": True})
+    return {a["id"]: a for a in got["agents"]}
+
+
+def dispatch_settings(s: Optional[DispatchIn]) -> dict:
+    try:
+        return dispatch.settings(s.to_settings() if s else None)
+    except ValueError as err:
+        raise HTTPException(status_code=422, detail=str(err)) from None
+
+
+def presence_of(agent: dict, at: datetime, ignore_schedule: bool = False) -> dict:
+    """Online now: active, and inside a session of its week (or the schedule set aside)."""
+    if agent["status"] != "active":
+        return {"online": False, "until": None}
+    if ignore_schedule:
+        return {"online": True, "until": None}
+    p = persona_of(agent)
+    now = schedule.online_at(p, agent["id"], at)
+    if not now["online"]:
+        return {"online": False, "until": None}
+    local = schedule.local_time(at, p["life"]["timeZone"])
+    left = now["until"] - local["minute"]
+    return {"online": True, "until": (at + timedelta(minutes=left)).isoformat()}
+
+
+def next_online(agent: dict, at: datetime, days: int = 7) -> Optional[str]:
+    """When its next session starts, within a week."""
+    if agent["status"] != "active":
+        return None
+    p = persona_of(agent)
+    tz = ZoneInfo(p["life"]["timeZone"])
+    local_now = at.astimezone(tz)
+    for d in range(days + 1):
+        day = (local_now + timedelta(days=d)).date()
+        weekday = (day.weekday() + 1) % 7
+        for s in schedule.sessions_on(p, agent["id"], day.isoformat(), weekday):
+            start = datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(minutes=s["from"])
+            if start > local_now:
+                return start.astimezone(timezone.utc).isoformat()
+    return None
+
+
+@router.get("/presence", summary="Which agents are online now, and until when")
+def presence(at: Optional[datetime] = None, ignore_schedule: bool = False,
+             authorization: KeyHeader = None, x_ocheso_key: AltKeyHeader = None):
+    now = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    agents = roster(key_hash(authorization, x_ocheso_key))
+    out = []
+    for a in agents.values():
+        p = persona_of(a)
+        here = presence_of(a, now, ignore_schedule)
+        out.append({"id": a["id"], "name": a["name"], "rating": a["rating"], "status": a["status"],
+                    "cadences": p["life"]["cadences"], "online": here["online"], "until": here["until"],
+                    "next_online": None if here["online"] else next_online(a, now)})
+    return {"at": now.isoformat(), "agents": out}
+
+
+@router.post("/seat", summary="A person is waiting for a game: should an agent take the seat, and which?")
+def seat(body: SeatIn, authorization: KeyHeader = None, x_ocheso_key: AltKeyHeader = None):
+    now = datetime.now(timezone.utc)
+    agents = roster(key_hash(authorization, x_ocheso_key))
+    views = []
+    for a in body.agents:
+        agent = agents.get(a.id)
+        if agent is None:
+            continue
+        views.append({"id": a.id, "rating": agent["rating"], "persona": persona_of(agent), "idle": a.idle,
+                      "online": presence_of(agent, now, body.ignore_schedule)["online"],
+                      "recentOpponents": a.recent_opponents})
+    s = body.seek
+    seek = {"id": s.id, "creatorId": s.creator_id, "creatorRating": s.creator_rating, "cadence": s.cadence,
+            "createdAtMs": s.created_at_ms, "heartbeatAtMs": s.heartbeat_at_ms, "isPosition": s.is_position,
+            "humanAlternatives": s.human_alternatives}
+    d = dispatch.decide_seat(seek, views, now.timestamp() * 1000, dispatch_settings(body.settings),
+                             rng_from(f"seat/{s.id}/{int(now.timestamp() // 5)}"))
+    out = {"action": d["action"], "reason": d.get("reason")}
+    if d["action"] == "take":
+        out.update({"agent": d["agentId"], "candidates": d["candidates"]})
+    if d["action"] == "wait":
+        out["retry_in_ms"] = int(d["retryInMs"])
+    return out
+
+
+@router.post("/agents/{agent_id}/challenge", summary="A person challenges an agent: accept, decline or let it sit")
+def challenge(agent_id: str, body: ChallengeIn, authorization: KeyHeader = None, x_ocheso_key: AltKeyHeader = None):
+    agent = roster(key_hash(authorization, x_ocheso_key)).get(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="This key cannot use that agent.")
+    now = datetime.now(timezone.utc)
+    m = {"id": agent_id, "rating": agent["rating"], "persona": persona_of(agent), "idle": body.idle,
+         "online": presence_of(agent, now, body.ignore_schedule)["online"], "recentOpponents": {}}
+    c = {"id": body.challenge_id, "challengerRating": body.challenger_rating, "cadence": body.cadence,
+         "rated": body.rated, "isPosition": body.is_position}
+    a = dispatch.answer_challenge(c, m, dispatch_settings(body.settings), rng_from(f"challenge/{body.challenge_id}"))
+    return {"action": a["action"], "after_ms": a["afterMs"], "online": m["online"]}
+
+
+@router.post("/agents/{agent_id}/friend-request", summary="A person asks an agent to be friends: accept, and when")
+def friend_request(agent_id: str, body: FriendIn, authorization: KeyHeader = None, x_ocheso_key: AltKeyHeader = None):
+    agent = roster(key_hash(authorization, x_ocheso_key)).get(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="This key cannot use that agent.")
+    a = dispatch.answer_friend_request(persona_of(agent), f"{agent_id}/{body.request_id}")
+    return {"accept": a["accept"], "after_ms": a["afterMs"]}
