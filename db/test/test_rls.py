@@ -438,4 +438,26 @@ allowed("a stranger's list does not include it", f"select count(*) from my_tourn
 # -----------------------------------------------------------------------------
 # Report
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Organisers adding players directly
+# -----------------------------------------------------------------------------
+ADD_T = value(
+    "insert into tournaments (owner_id, title, game, variant, format, clock_base_s, starts_at, rounds_count, max_participants) "
+    f"values ('{OWNER}', 'Add Test', 'chess', 'standard', 'swiss', 300, now(), 3, 2) returning id"
+)
+P2_NAME = value(f"select username from profiles where id = '{P2}'")
+P3_NAME = value(f"select username from profiles where id = '{P3}'")
+P4_NAME = value(f"select username from profiles where id = '{P4}'")
+denied("a stranger cannot add players", f"select status from add_participant('{ADD_T}', '{P2_NAME}')", STRANGER)
+denied("a player cannot add players to someone else's event", f"select status from add_participant('{ADD_T}', '{P3_NAME}')", P2)
+allowed("the owner adds a player by username", f"select status || ' ' || joined_via from add_participant('{ADD_T}', '@{P2_NAME}')", OWNER, "approved added")
+denied("adding someone who does not exist says so", f"select status from add_participant('{ADD_T}', 'nobody_here')", OWNER)
+allowed("adding twice is harmless", f"select status from add_participant('{ADD_T}', '{P2_NAME}')", OWNER, "approved")
+allowed("the second place is taken", f"select status from add_participant('{ADD_T}', '{P3_NAME}')", OWNER, "approved")
+denied("a full event takes nobody else, even from its owner", f"select status from add_participant('{ADD_T}', '{P4_NAME}')", OWNER)
+value(f"update tournaments set status = 'registration' where id = '{ADD_T}'")
+value(f"update tournaments set status = 'live' where id = '{ADD_T}'")
+denied("nobody is added once it has started", f"select status from add_participant('{ADD_T}', '{P4_NAME}')", OWNER)
+
 sys.exit(1 if report() else 0)

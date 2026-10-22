@@ -195,6 +195,46 @@ returns boolean language sql stable security definer set search_path = public, e
                   where id = t and is_listed and participants_visible and games_watchable and status <> 'draft');
 $$;
 
+-- Ratings move after each rated game: Elo, K 32 under 2100, 24 under 2400,
+-- 16 above. Rated means two players, a result on the board, and at least a
+-- move each - a no-show flag or a first-move resignation says nothing about
+-- strength, and an arbiter's result (a forfeit, a correction) is not a game.
+-- Corrections to a finished result do not re-rate.
+create or replace function private.rate(g public.games)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+declare
+  kind text;
+  rw   int;
+  rb   int;
+  ew   numeric;
+  sw   numeric;
+begin
+  if g.black_id is null or g.result not in ('white', 'black', 'draw')
+     or g.termination in ('arbiter', 'bye') or g.ply < 2 then
+    return;
+  end if;
+  select game::text into kind from tournaments where id = g.tournament_id;
+  if kind = 'chess' then
+    select chess_rating into rw from profiles where id = g.white_id;
+    select chess_rating into rb from profiles where id = g.black_id;
+  else
+    select checkers_rating into rw from profiles where id = g.white_id;
+    select checkers_rating into rb from profiles where id = g.black_id;
+  end if;
+  ew := 1 / (1 + power(10::numeric, (rb - rw) / 400.0));
+  sw := case g.result when 'white' then 1 when 'black' then 0 else 0.5 end;
+  rw := greatest(100, least(3500, rw + round((case when rw < 2100 then 32 when rw < 2400 then 24 else 16 end) * (sw - ew))::int));
+  rb := greatest(100, least(3500, rb + round((case when rb < 2100 then 32 when rb < 2400 then 24 else 16 end) * (ew - sw))::int));
+  if kind = 'chess' then
+    update profiles set chess_rating = rw where id = g.white_id;
+    update profiles set chess_rating = rb where id = g.black_id;
+  else
+    update profiles set checkers_rating = rw where id = g.white_id;
+    update profiles set checkers_rating = rb where id = g.black_id;
+  end if;
+end $$;
+revoke all on function private.rate(public.games) from public, anon, authenticated;
+
 -- Ends a game, freezes the mover's clock where it stood, and closes the round
 -- when it was the last one open.
 create or replace function private.finish_game(p_game uuid, p_result public.game_result, p_termination text)
@@ -215,6 +255,7 @@ begin
     finished_at = now(), draw_offer = null, legal = '[]'
   where id = p_game
   returning * into g;
+  perform private.rate(g);
   perform private.close_round(g.round_id);
   return g;
 end $$;
@@ -587,21 +628,26 @@ language sql security definer set search_path = public, extensions as $$
   delete from arena_queue where tournament_id = p_tournament and user_id = auth.uid();
 $$;
 
--- Results for standings and pairings, without positions or moves. Readable
--- wherever the player list is: the scoreboard of a public event is public even
--- when its games are not open to watch.
+-- Results for standings and pairings, without positions or moves. Visible
+-- wherever the player list is - get_roster's rule: anyone who can open the
+-- event, unless the organiser hides who has entered. For an unlisted event that
+-- means people holding its link, which is what knowing its id amounts to: ids
+-- of unlisted events are not readable anywhere else.
+drop function if exists public.get_results(uuid);
 create or replace function public.get_results(p_tournament uuid)
 returns table (
-  game_id uuid, round_number int, board int, white_id uuid, black_id uuid,
+  game_id uuid, round_number int, round_status public.round_status, board int, white_id uuid, black_id uuid,
   status public.game_status, result public.game_result, termination text,
   tiebreak_of uuid, finished_at timestamptz
 )
 language sql stable security definer set search_path = public, extensions as $$
-  select g.id, r.number, g.board, g.white_id, g.black_id, g.status, g.result, g.termination,
+  select g.id, r.number, r.status, g.board, g.white_id, g.black_id, g.status, g.result, g.termination,
          g.tiebreak_of, g.finished_at
-    from games g left join rounds r on r.id = g.round_id
+    from games g
+    join tournaments t on t.id = g.tournament_id
+    left join rounds r on r.id = g.round_id
    where g.tournament_id = p_tournament
-     and (private.roster_is_public(p_tournament)
+     and ((t.status <> 'draft' and t.participants_visible)
           or private.is_tournament_staff(p_tournament)
           or private.is_tournament_participant(p_tournament))
    order by r.number nulls last, g.board nulls last, g.created_at;

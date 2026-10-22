@@ -30,5 +30,11 @@ PID=$!
 trap 'kill $PID 2>/dev/null' EXIT
 sleep 2
 
-E2E_DB="postgresql://postgres@/$DBNAME?host=$HOST&port=$PGPORT" E2E_JWT_SECRET="$SECRET" \
-  E2E_REST="http://127.0.0.1:$PORT" $PYTHON db/test/e2e_play.py
+export E2E_DB="postgresql://postgres@/$DBNAME?host=$HOST&port=$PGPORT" E2E_JWT_SECRET="$SECRET" \
+  E2E_REST="http://127.0.0.1:$PORT"
+status=0
+for suite in db/test/e2e_manage.py db/test/e2e_play.py; do
+  echo "== $suite"
+  $PYTHON "$suite" || status=1
+done
+exit $status

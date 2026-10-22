@@ -20,6 +20,12 @@ class JoinIn(BaseModel):
     invite: Optional[str] = Field(None, max_length=64)
 
 
+class AddIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # With or without the @.
+    username: str = Field(pattern=r"^@?[A-Za-z0-9_]{3,24}$")
+
+
 class ParticipantOut(BaseModel):
     id: str
     tournament_id: str

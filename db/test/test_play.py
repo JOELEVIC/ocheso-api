@@ -205,12 +205,32 @@ denied("you cannot resign someone else's game", f"select result from resign('{G3
 allowed("Black resigns", f"select result || ' ' || termination from resign('{G3}')", C, "white resignation")
 
 # -----------------------------------------------------------------------------
+# Ratings
+# -----------------------------------------------------------------------------
+check("no-shows, first-move resignations and arbiter results leave ratings alone",
+      value(f"select string_agg(chess_rating::text, ',') from profiles where id in ('{A}','{B}','{C}','{D}')") == "1500,1500,1500,1500")
+G4 = value(f"select id from games where tournament_id = '{TID}' and white_id = '{D}' and round_id is not null and status = 'live'")
+AFTER_E5 = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"
+allowed("D opens", f"select ply from play_move({ruling('move', D, {'game': G4, 'ply': 0, 'before': START, 'move': 'e2e4', 'san': 'e4', 'after': AFTER_E4, 'turn': 'black'})})", D, "1")
+allowed("A replies", f"select ply from play_move({ruling('move', A, {'game': G4, 'ply': 1, 'before': AFTER_E4, 'move': 'e7e5', 'san': 'e5', 'after': AFTER_E5, 'turn': 'white'})})", A, "2")
+allowed("A resigns a game that was played", f"select result from resign('{G4}')", A, "white")
+check("a rated win moves both players by K/2 at equal ratings",
+      value(f"select (select chess_rating from profiles where id = '{D}') || ',' || (select chess_rating from profiles where id = '{A}')") == "1516,1484")
+check("players cannot set their own rating", not sql(f"update profiles set chess_rating = 2800 where id = '{A}'", A)[0]
+      or value(f"select chess_rating from profiles where id = '{A}'") == "1484")
+
+# -----------------------------------------------------------------------------
 # Who sees what
 # -----------------------------------------------------------------------------
 value(f"update tournaments set is_listed = false where id = '{TID}'")
 allowed("a stranger sees no games of an unlisted event", "select count(*) from games", STRANGER, "0")
 allowed("a visitor sees no games of an unlisted event", "select count(*) from games", ANON, "0")
-allowed("a stranger sees no results of an unlisted event", f"select count(*) from get_results('{TID}')", STRANGER, "0")
+allowed("a stranger holding an unlisted event's link sees its results, like its players",
+        f"select count(*) from get_results('{TID}')", STRANGER, "4")
+value(f"update tournaments set participants_visible = false where id = '{TID}'")
+allowed("unless the organiser hides who has entered", f"select count(*) from get_results('{TID}')", STRANGER, "0")
+allowed("which entrants still see past", f"select count(*) from get_results('{TID}')", C, "4")
+value(f"update tournaments set participants_visible = true where id = '{TID}'")
 allowed("an entrant sees every game", f"select count(*) from games where tournament_id = '{TID}'", C, "4")
 allowed("an entrant sees the moves", f"select count(*) from moves where game_id = '{G1}'", C, "1")
 value(f"update tournaments set is_listed = true, games_watchable = false where id = '{TID}'")

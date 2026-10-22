@@ -503,6 +503,14 @@ begin
   returning p.* into row;
 
   if not found then
+    -- Say why: an event already under way is the usual reason, and "nothing
+    -- to withdraw from" would read as if the entry had vanished.
+    if exists (select 1 from tournaments t join participants p on p.tournament_id = t.id
+                where t.slug = p_slug and p.user_id = auth.uid()
+                  and t.status not in ('draft', 'registration')) then
+      raise exception 'the tournament has started; ask the organiser to withdraw you'
+        using errcode = 'check_violation';
+    end if;
     raise exception 'nothing to withdraw from' using errcode = 'no_data_found';
   end if;
   return row;
@@ -511,6 +519,46 @@ end $$;
 -- An organiser approving or rejecting an entry. A function rather than a plain
 -- UPDATE so capacity is checked at the moment of approval - the same cap
 -- join_tournament() enforces, which a direct status update would step around.
+-- An organiser entering someone by username: approved at once, capacity
+-- checked, recorded as 'added' so the entry list says how they got in.
+-- Owners and co-admins only, before the start.
+create or replace function public.add_participant(p_tournament uuid, p_username text)
+returns public.participants
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  t      tournaments;
+  person profiles;
+  taken  int;
+  row    participants;
+begin
+  select * into t from tournaments where id = p_tournament;
+  if not found or not private.is_tournament_manager(t.id) then
+    raise exception 'no such tournament' using errcode = 'no_data_found';
+  end if;
+  if t.status not in ('draft', 'registration') then
+    raise exception 'entries are closed' using errcode = 'check_violation';
+  end if;
+  select * into person from profiles where username = lower(trim(both '@' from trim(p_username)));
+  if not found then
+    raise exception 'nobody is called @%', lower(trim(both '@' from trim(p_username))) using errcode = 'no_data_found';
+  end if;
+  if t.max_participants is not null then
+    select count(*) into taken from participants where tournament_id = t.id and status = 'approved';
+    if taken >= t.max_participants then
+      raise exception 'this tournament is full' using errcode = 'check_violation';
+    end if;
+  end if;
+  insert into participants (tournament_id, user_id, status, rating_at_entry, joined_via, decided_by, decided_at)
+  values (t.id, person.id, 'approved',
+          case when t.game = 'chess' then person.chess_rating else person.checkers_rating end,
+          'added', auth.uid(), now())
+  on conflict (tournament_id, user_id) do update
+    set status = 'approved', joined_via = 'added', decided_by = auth.uid(), decided_at = now(),
+        rating_at_entry = excluded.rating_at_entry
+  returning * into row;
+  return row;
+end $$;
+
 create or replace function public.decide_participant(p_participant uuid, p_status public.participant_status)
 returns public.participants
 language plpgsql security definer set search_path = public, extensions as $$
@@ -773,10 +821,12 @@ grant delete on public.participants to authenticated;
 revoke all on function public.join_tournament(text, text, text) from public, anon;
 revoke all on function public.withdraw_from_tournament(text) from public, anon;
 revoke all on function public.decide_participant(uuid, public.participant_status) from public, anon;
+revoke all on function public.add_participant(uuid, text) from public, anon;
 revoke all on function public.rotate_invite(uuid) from public, anon;
 grant execute on function public.join_tournament(text, text, text) to authenticated;
 grant execute on function public.withdraw_from_tournament(text) to authenticated;
 grant execute on function public.decide_participant(uuid, public.participant_status) to authenticated;
+grant execute on function public.add_participant(uuid, text) to authenticated;
 grant execute on function public.rotate_invite(uuid) to authenticated;
 revoke all on function public.set_tournament_status(uuid, public.tournament_status) from public, anon;
 grant execute on function public.set_tournament_status(uuid, public.tournament_status) to authenticated;

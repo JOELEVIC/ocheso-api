@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Response
 
 from db import CallerDb, UserDb, one, rows
 from routers.tournaments import find
-from schemas.participant import JoinIn, ParticipantOut, RosterEntry
+from schemas.participant import AddIn, JoinIn, ParticipantOut, RosterEntry
 
 router = APIRouter(tags=["Participants"])
 
@@ -51,6 +51,18 @@ def join(slug: str, body: JoinIn, db: UserDb):
     return one(
         db.rpc("join_tournament", {"p_slug": slug, "p_code": body.code, "p_invite": body.invite}).execute()
     )
+
+
+@router.post(
+    "/v1/tournaments/{slug}/participants",
+    response_model=ParticipantOut,
+    summary="Add a player by username (organisers)",
+)
+def add(slug: str, body: AddIn, db: UserDb):
+    # Approved at once and recorded as 'added'; capacity and timing are the
+    # database's to check (add_participant in db/schema.sql).
+    t = find(db, slug)
+    return one(db.rpc("add_participant", {"p_tournament": t["id"], "p_username": body.username}).execute())
 
 
 @router.post("/v1/tournaments/{slug}/withdraw", response_model=ParticipantOut, summary="Withdraw before the start")

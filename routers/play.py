@@ -126,7 +126,12 @@ def _publish(db, by: str, t: dict, round_no: Optional[int], pairs: list[pairing.
 def list_rounds(slug: str, db: CallerDb):
     t = find(db, slug)
     results = rows(db.rpc("get_results", {"p_tournament": t["id"]}).execute())
+    # Round ids come from the table, which only staff and entrants of an
+    # unlisted event can read; everyone else gets the status from the results.
     meta = {r["number"]: r for r in rows(db.table("rounds").select("*").eq("tournament_id", t["id"]).execute())}
+    for g in results:
+        if g["round_number"] is not None and g["round_number"] not in meta:
+            meta[g["round_number"]] = {"id": None, "status": g["round_status"], "started_at": None}
     names = _people(db, [g["white_id"] for g in results] + [g["black_id"] for g in results])
     rounds: dict[Optional[int], list[dict]] = {}
     for g in results:
