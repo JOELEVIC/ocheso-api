@@ -8,3 +8,6 @@ pytest>=8.0.0
 httpx>=0.27.0
 chess>=1.11.0
 networkx>=3.3
+# Agents: Maia's policy (onnxruntime). Stockfish is a binary - agents/engines.py.
+numpy>=2.0
+onnxruntime>=1.20

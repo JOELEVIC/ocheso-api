@@ -1,0 +1,120 @@
+{
+ "beginnerWhite": [
+  {
+   "name": "Scholar's attempt",
+   "moves": "e2e4 e7e5 d1h5 b8c6 f1c4"
+  },
+  {
+   "name": "Scholar's attempt (Qf3)",
+   "moves": "e2e4 e7e5 f1c4 b8c6 d1f3"
+  },
+  {
+   "name": "Open game",
+   "moves": "e2e4 e7e5 g1f3 b8c6 f1c4"
+  }
+ ],
+ "italian": [
+  {
+   "name": "Italian",
+   "moves": "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 c2c3"
+  },
+  {
+   "name": "Two knights",
+   "moves": "e2e4 e7e5 g1f3 b8c6 f1c4 g8f6 d2d3"
+  }
+ ],
+ "ruyLopez": [
+  {
+   "name": "Ruy Lopez",
+   "moves": "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1"
+  }
+ ],
+ "queensGambit": [
+  {
+   "name": "Queen's Gambit",
+   "moves": "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6"
+  },
+  {
+   "name": "Queen's Gambit Accepted",
+   "moves": "d2d4 d7d5 c2c4 d5c4 e2e3"
+  }
+ ],
+ "london": [
+  {
+   "name": "London",
+   "moves": "d2d4 d7d5 c1f4 g8f6 e2e3 e7e6 g1f3"
+  },
+  {
+   "name": "London vs Nf6",
+   "moves": "d2d4 g8f6 c1f4 d7d5 e2e3"
+  }
+ ],
+ "blackOpenGame": [
+  {
+   "name": "e5",
+   "moves": "e2e4 e7e5 g1f3 b8c6"
+  },
+  {
+   "name": "Two knights",
+   "moves": "e2e4 e7e5 g1f3 b8c6 f1c4 g8f6"
+  }
+ ],
+ "sicilian": [
+  {
+   "name": "Sicilian",
+   "moves": "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6"
+  },
+  {
+   "name": "Sicilian (Nc6)",
+   "moves": "e2e4 c7c5 g1f3 b8c6"
+  }
+ ],
+ "french": [
+  {
+   "name": "French",
+   "moves": "e2e4 e7e6 d2d4 d7d5"
+  }
+ ],
+ "caroKann": [
+  {
+   "name": "Caro-Kann",
+   "moves": "e2e4 c7c6 d2d4 d7d5"
+  }
+ ],
+ "scandinavian": [
+  {
+   "name": "Scandinavian",
+   "moves": "e2e4 d7d5 e4d5 d8d5"
+  }
+ ],
+ "blackVsD4Classical": [
+  {
+   "name": "Queen's pawn",
+   "moves": "d2d4 d7d5 c2c4 e7e6"
+  },
+  {
+   "name": "Slav",
+   "moves": "d2d4 d7d5 c2c4 c7c6"
+  }
+ ],
+ "blackVsD4Indian": [
+  {
+   "name": "Indian",
+   "moves": "d2d4 g8f6 c2c4 e7e6"
+  },
+  {
+   "name": "King's Indian",
+   "moves": "d2d4 g8f6 c2c4 g7g6"
+  }
+ ],
+ "blackVsOther": [
+  {
+   "name": "Centre",
+   "moves": "g1f3 d7d5"
+  },
+  {
+   "name": "English",
+   "moves": "c2c4 e7e5"
+  }
+ ]
+}
