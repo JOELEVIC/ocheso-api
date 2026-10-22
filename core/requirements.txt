@@ -1,0 +1,10 @@
+# Deployed: the light function - tournaments, play, accounts (vercel.json,
+# service "core", root core/). Nothing here imports numpy or onnxruntime, and
+# only postgrest of the Supabase client.
+fastapi>=0.110.0
+postgrest>=2.20.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.1
+chess>=1.11.0
+networkx>=3.3

@@ -42,7 +42,9 @@ os.environ["REFEREE_SECRET"] = subprocess.run(
     ["psql", DB, "-tAc", "select secret from private.referee"], capture_output=True, text=True, check=True
 ).stdout.strip()
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+# The light API lives in core/ (its own Vercel function); dev.py serves both halves.
+sys.path[:0] = [os.path.join(_ROOT, "core"), _ROOT]
 import db as dbmod  # noqa: E402
 from postgrest import SyncPostgrestClient  # noqa: E402
 
@@ -55,7 +57,7 @@ def _local_client(bearer: str) -> SyncPostgrestClient:
 dbmod._client = _local_client
 from fastapi.testclient import TestClient  # noqa: E402
 
-from main import app  # noqa: E402
+from dev import app  # noqa: E402  (the whole API, both functions)
 
 api = TestClient(app)
 results: list[tuple[bool, str, str]] = []

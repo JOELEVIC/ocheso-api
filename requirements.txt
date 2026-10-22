@@ -1,13 +1,12 @@
+# Deployed: the agents function (vercel.json, service "agents", root "."). The
+# light function has its own list, core/requirements.txt; local development
+# installs both through requirements-dev.txt.
 fastapi>=0.110.0
-uvicorn[standard]>=0.28.0
-supabase>=2.3.0
+postgrest>=2.20.0
 pydantic>=2.6.0
-python-dotenv>=1.0.1
 pydantic-settings>=2.2.0
-pytest>=8.0.0
-httpx>=0.27.0
+python-dotenv>=1.0.1
 chess>=1.11.0
-networkx>=3.3
-# Agents: Maia's policy (onnxruntime). Stockfish is a binary - agents/engines.py.
+# Maia's policy. Stockfish is a binary in agents/bin (agents/engines.py).
 numpy>=2.0
 onnxruntime>=1.20

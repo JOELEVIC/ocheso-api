@@ -1,0 +1,7 @@
+# Local only: everything both functions need, plus the server and the tests.
+# Vercel installs requirements.txt (agents) and core/requirements.txt (core).
+-r requirements.txt
+-r core/requirements.txt
+uvicorn[standard]>=0.28.0
+httpx>=0.27.0
+pytest>=8.0.0

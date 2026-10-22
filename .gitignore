@@ -36,3 +36,15 @@ MANIFEST
 .vscode/
 *.swp
 *.swo
+
+# Vercel: a local `vercel build` writes these (each service gets its own
+# .vercel/), and generates pyproject/uv files from requirements.txt - never
+# commit those, or they replace requirements.txt as the manifest.
+.vercel/
+_uv/
+/pyproject.toml
+/uv.lock
+/.python-version
+/core/pyproject.toml
+/core/uv.lock
+/core/.python-version

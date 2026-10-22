@@ -19,58 +19,32 @@ docs/OCHESO_BUILD.md:
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from postgrest import APIError
+from routers import participants, play, profiles, staff, tournaments
+from web import make_app
 
-from config import settings
-from db import fail
-from routers import agents, connect, participants, play, profiles, staff, tournaments
-
-app = FastAPI(
+# The light function. Agents (/v1/agents, /v1/agent-keys, /v1/connect) are a
+# separate one - agents_main.py at the repo root - so a tournament page never
+# loads Stockfish, Maia or onnxruntime. vercel.json routes between them.
+app = make_app(
     title="Ocheso API",
     description=(
-        "Tournaments for chess and checkers, and agents: human-like opponents to build, hire and plug into "
-        "your own platform. Every request runs as its caller; row level security decides."
+        "Tournaments for chess and checkers. Every request runs as its caller; row level security decides. "
+        "Agents are documented at /v1/agents/docs."
     ),
-    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.origins,
-    # Bearer tokens in a header, never cookies - so no credentials, and a
-    # stolen page cannot ride a session it does not hold the token for.
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Ocheso-Key"],
-)
-
-
-@app.exception_handler(APIError)
-async def database_refused(_: Request, error: APIError) -> JSONResponse:
-    # The database is where "no" is decided; this is where it becomes the right
-    # HTTP status. The old API answered 400 to everything, so a full event, an
-    # expired session and a mistyped slug all looked the same to the site.
-    http = fail(error)
-    return JSONResponse(status_code=http.status_code, content={"detail": http.detail})
-
 
 app.include_router(tournaments.router)
 app.include_router(participants.router)
 app.include_router(staff.router)
 app.include_router(profiles.router)
 app.include_router(play.router)
-app.include_router(agents.router)
-app.include_router(connect.router)
 
 
 @app.get("/", tags=["Health"], include_in_schema=False)
 def root():
-    return {"service": "ocheso-api", "docs": "/docs"}
+    return {"service": "ocheso-api", "docs": "/docs", "agents": "/v1/agents/docs"}
 
 
 @app.get("/health", tags=["Health"], summary="Liveness")

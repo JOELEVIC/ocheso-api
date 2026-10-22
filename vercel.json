@@ -1,4 +1,32 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "regions": ["dub1"]
+  "regions": ["dub1"],
+  "services": {
+    "core": {
+      "root": "core/",
+      "framework": "fastapi",
+      "entrypoint": "main:app",
+      "functions": { "main.py": { "regions": ["dub1"] } }
+    },
+    "agents": {
+      "root": ".",
+      "framework": "fastapi",
+      "entrypoint": "agents_main:app",
+      "functions": {
+        "agents_main.py": {
+          "regions": ["dub1"],
+          "excludeFiles": "{core/.vercel/**,core/uv.lock,core/pyproject.toml,_uv/**,tests/**,db/**,agents/golden/**,agents/data/calibration/**,dev.py,**/.pytest_cache/**,.idea/**,.env*}"
+        }
+      }
+    }
+  },
+  "rewrites": [
+    { "source": "/v1/agents", "destination": { "service": "agents" } },
+    { "source": "/v1/agents/(.*)", "destination": { "service": "agents" } },
+    { "source": "/v1/agent-keys", "destination": { "service": "agents" } },
+    { "source": "/v1/agent-keys/(.*)", "destination": { "service": "agents" } },
+    { "source": "/v1/connect", "destination": { "service": "agents" } },
+    { "source": "/v1/connect/(.*)", "destination": { "service": "agents" } },
+    { "source": "/(.*)", "destination": { "service": "core" } }
+  ]
 }

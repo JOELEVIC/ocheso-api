@@ -17,8 +17,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agents import service
-from main import app
-from routers.connect import key_hash, signed_payload
+from agent_routes.connect import key_hash, signed_payload
+from agents_main import app
 
 client = TestClient(app)
 
