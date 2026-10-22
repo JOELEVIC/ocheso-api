@@ -26,11 +26,14 @@ from postgrest import APIError
 
 from config import settings
 from db import fail
-from routers import participants, play, profiles, staff, tournaments
+from routers import agents, connect, participants, play, profiles, staff, tournaments
 
 app = FastAPI(
     title="Ocheso API",
-    description="Tournaments for chess and checkers. Every request runs as its caller; row level security decides.",
+    description=(
+        "Tournaments for chess and checkers, and agents: human-like opponents to build, hire and plug into "
+        "your own platform. Every request runs as its caller; row level security decides."
+    ),
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -43,7 +46,7 @@ app.add_middleware(
     # stolen page cannot ride a session it does not hold the token for.
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Ocheso-Key"],
 )
 
 
@@ -61,6 +64,8 @@ app.include_router(participants.router)
 app.include_router(staff.router)
 app.include_router(profiles.router)
 app.include_router(play.router)
+app.include_router(agents.router)
+app.include_router(connect.router)
 
 
 @app.get("/", tags=["Health"], include_in_schema=False)

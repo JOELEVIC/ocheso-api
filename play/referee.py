@@ -51,3 +51,14 @@ def sign(kind: str, by: str, body: dict[str, Any]) -> tuple[str, str]:
     )
     sig = hmac.new(settings.REFEREE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return payload, sig
+
+
+def sign_request(kind: str, body: dict[str, Any]) -> tuple[str, str]:
+    """A request made for a platform holding an agent key (db/agents.sql). No
+    `by`: a platform has no account. The database checks the key inside it."""
+    if not settings.REFEREE_SECRET:
+        raise HTTPException(status_code=503, detail="Agents aren't switched on yet: the API has no signing key.")
+    payload = json.dumps({**body, "kind": kind, "exp": int(time.time()) + TTL_SECONDS},
+                         separators=(",", ":"), sort_keys=True)
+    sig = hmac.new(settings.REFEREE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return payload, sig

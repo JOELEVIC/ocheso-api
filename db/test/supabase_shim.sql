@@ -44,3 +44,19 @@ alter default privileges in schema public grant all on functions to anon, authen
 -- Supabase's own default search_path for API roles.
 alter role anon          set search_path = "$user", public, extensions;
 alter role authenticated set search_path = "$user", public, extensions;
+
+-- Realtime's broadcast-from-the-database function, with Supabase's signature.
+-- Here it only records what would have been sent, so tests can read it.
+create schema if not exists realtime;
+create table if not exists realtime.sent (
+  id      bigserial primary key,
+  topic   text not null,
+  event   text not null,
+  payload jsonb not null,
+  private boolean not null,
+  at      timestamptz not null default now()
+);
+create or replace function realtime.send(payload jsonb, event text, topic text, private boolean default true)
+returns void language sql as $$
+  insert into realtime.sent (topic, event, payload, private) values (topic, event, payload, private);
+$$;

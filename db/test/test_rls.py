@@ -116,7 +116,11 @@ check(
 )
 # The read paths a visitor needs: an event by its link, its players, and -
 # once db/play.sql is applied - its scoreboard and the server clock.
-ANON_CALLABLE = {"get_roster", "get_tournament", "get_results", "server_now"}
+# The agent_machine_* functions are how platforms reach agents through the
+# API; they refuse anything the API did not sign (db/test/test_agents.py).
+ANON_CALLABLE = {"get_roster", "get_tournament", "get_results", "server_now",
+                 "agent_machine_key", "agent_machine_use", "agent_machine_open",
+                 "agent_machine_session", "agent_machine_record", "agent_machine_end"}
 check(
     "no public function an anonymous visitor can call except the read paths",
     set(value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "

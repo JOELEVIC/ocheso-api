@@ -61,6 +61,13 @@ def user_db(authorization: Annotated[Optional[str], Header()] = None) -> SyncPos
     return _client(token)
 
 
+def anon_db() -> SyncPostgrestClient:
+    """As an anonymous visitor, whoever is asking. For platforms holding an agent
+    key (routers/connect.py): they have no account, and their requests carry the
+    API's signature instead, which the database checks."""
+    return _client(settings.SUPABASE_ANON_KEY)
+
+
 CallerDb = Annotated[SyncPostgrestClient, Depends(caller_db)]
 UserDb = Annotated[SyncPostgrestClient, Depends(user_db)]
 
@@ -78,6 +85,7 @@ _STATUS = {
     "22023": 400,     # invalid_parameter_value
     "42501": 403,     # insufficient_privilege - a column this role cannot write
     "28000": 403,     # invalid_authorization - e.g. a wrong entry code
+    "40001": 409,     # serialization_failure - e.g. a move recorded twice for one turn
     "PGRST301": 401,  # JWT expired / invalid
     "PGRST302": 401,
 }
@@ -89,7 +97,7 @@ def fail(error: APIError) -> HTTPException:
     status = _STATUS.get(code, 400)
     # Our own functions raise sentences written for people; pass those through.
     # For everything else, keep Postgres internals out of the response.
-    own = code in ("P0002", "23514", "28000")
+    own = code in ("P0002", "23514", "28000", "40001", "22023")
     message = (error.message if own and error.message else None) or {
         401: "Your session has expired. Sign in again.",
         403: "You don't have permission to do that.",
