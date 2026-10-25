@@ -13,9 +13,10 @@ SECRET="e2e-local-only-secret-$(date +%s)-not-for-anything-real"
 
 dropdb $PG --if-exists $DBNAME
 createdb $PG $DBNAME
-for f in db/test/supabase_shim.sql db/schema.sql db/play.sql db/agents.sql; do
-  psql $PG -d $DBNAME -X -q -v ON_ERROR_STOP=1 -f "$f" >/dev/null 2>&1
-done
+# The whole database, as production has it: the shim, then every file in
+# db/apply.sh's order, each in its own transaction.
+psql $PG -d $DBNAME -X -q -v ON_ERROR_STOP=1 -f db/test/supabase_shim.sql >/dev/null 2>&1
+db/apply.sh $PG -d $DBNAME >/dev/null
 psql $PG -d $DBNAME -X -q -c "do \$\$ begin create role authenticator login noinherit; exception when duplicate_object then null; end \$\$; grant anon, authenticated to authenticator;"
 
 HOST=$(echo "$PG" | sed -E 's/.*-h ([^ ]+).*/\1/')

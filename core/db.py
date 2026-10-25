@@ -18,12 +18,42 @@ trusts a token - it only passes it through.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
 from fastapi import Depends, Header, HTTPException
 from postgrest import APIError, SyncPostgrestClient
 
 from config import settings
+from play.referee import sign_request
+from tokens import PLATFORM_PREFIXES
+
+
+class Refusal(HTTPException):
+    """An HTTPException that also names a stable `code`, so a client can branch
+    on {detail, code} without parsing sentences written for people. Raised
+    plain, an HTTPException still gets a code from its status (web.py)."""
+
+    def __init__(self, status_code: int, detail: Any = None, code: Optional[str] = None,
+                 headers: Optional[dict[str, str]] = None) -> None:
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
+        self.code = code
+
+
+# The code an answer carries when nothing more specific was said.
+CODES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    413: "too_large",
+    422: "invalid",
+    429: "rate_limited",
+    500: "internal",
+    503: "unavailable",
+}
 
 
 def _client(bearer: str) -> SyncPostgrestClient:
@@ -44,6 +74,19 @@ def _token(authorization: Optional[str]) -> Optional[str]:
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Authorization must be a Bearer token.")
+    # An Ocheso key or session sent where a sign-in token belongs. Refused here,
+    # before any request is built: forwarded, it would sit in the gateway's
+    # logs (they record Authorization) and PostgREST would only say "bad JWT".
+    # Org keys go to /v1/platform/*, player tokens to POST /v1/embed/sessions,
+    # sessions in X-Ocheso-Session, agent keys to /v1/connect - each of which
+    # sends the database a hash, never the token (docs/OCHESO_PLATFORMS.md B).
+    if token.strip().lower().startswith(PLATFORM_PREFIXES):
+        raise Refusal(
+            401,
+            "This route takes a sign-in token. Ocheso keys and sessions (ochs_, ochp_, oche_, och_) "
+            "are never sent here.",
+            code="wrong_token",
+        )
     return token
 
 
@@ -68,6 +111,41 @@ def anon_db() -> SyncPostgrestClient:
     return _client(settings.SUPABASE_ANON_KEY)
 
 
+def jwt_db(authorization: Optional[str]) -> SyncPostgrestClient:
+    """user_db outside a dependency, for routes that take a sign-in token only
+    sometimes (an embed preview)."""
+    return user_db(authorization)
+
+
+# -----------------------------------------------------------------------------
+# The three platform dispatchers (db/platforms.sql). Like the agents' calls
+# (agent_routes/connect.py), a request goes in as anon, signed by this API with
+# REFEREE_SECRET (play/referee.py sign_request): the signature is the gate, the
+# `kind` inside it picks what the dispatcher does, and each dispatcher answers
+# only its own whitelist of kinds. Keys, player tokens and sessions travel as
+# SHA-256 hashes inside the signed payload - never as a bearer, never in a URL.
+#
+#   embed_call   emb-*   embed sessions and the frame's public reads
+#   org_call     org-*   a platform's server holding an ochs_ key
+#   system_call  sys-*   the autopilot tick
+# -----------------------------------------------------------------------------
+def _dispatch(fn: str, kind: str, body: dict, off: str) -> Any:
+    payload, sig = sign_request(kind, body, off=off)
+    return anon_db().rpc(fn, {"p_payload": payload, "p_sig": sig}).execute().data
+
+
+def embed_call(kind: str, body: dict) -> Any:
+    return _dispatch("embed_call", kind, body, "Embeds aren't switched on yet: the API has no signing key.")
+
+
+def org_call(kind: str, body: dict) -> Any:
+    return _dispatch("org_call", kind, body, "The platform API isn't switched on yet: the API has no signing key.")
+
+
+def system_call(kind: str, body: dict) -> Any:
+    return _dispatch("system_call", kind, body, "The autopilot isn't switched on yet: the API has no signing key.")
+
+
 CallerDb = Annotated[SyncPostgrestClient, Depends(caller_db)]
 UserDb = Annotated[SyncPostgrestClient, Depends(user_db)]
 
@@ -88,7 +166,16 @@ _STATUS = {
     "40001": 409,     # serialization_failure - e.g. a move recorded twice for one turn
     "PGRST301": 401,  # JWT expired / invalid
     "PGRST302": 401,
+    # Ocheso's own SQLSTATEs (db/platforms.sql). OC429 is private.throttle: too
+    # many player tokens, sessions, handoffs, pings or embed actions in its
+    # window. OC401 is a player token or embed session that is unknown,
+    # expired or revoked - 401, so the frame asks the page for a new identity
+    # instead of showing "forbidden".
+    "OC429": 429,
+    "OC401": 401,
 }
+
+_CODE = {"OC429": "rate_limited", "OC401": "session_expired"}
 
 
 def fail(error: APIError) -> HTTPException:
@@ -97,14 +184,18 @@ def fail(error: APIError) -> HTTPException:
     status = _STATUS.get(code, 400)
     # Our own functions raise sentences written for people; pass those through.
     # For everything else, keep Postgres internals out of the response.
-    own = code in ("P0002", "23514", "28000", "40001", "22023")
+    own = code in ("P0002", "23514", "28000", "40001", "22023", "OC429", "OC401")
     message = (error.message if own and error.message else None) or {
         401: "Your session has expired. Sign in again.",
         403: "You don't have permission to do that.",
         404: "Not found.",
         409: "That conflicts with the current state.",
+        429: "Too many requests. Wait a minute and try again.",
     }.get(status, "That request could not be completed.")
-    return HTTPException(status_code=status, detail=message)
+    # The shortest throttle window is a minute (spec C10). Longer ones say so
+    # in their own sentence; this is the floor a well-behaved client waits.
+    headers = {"Retry-After": "60"} if status == 429 else None
+    return Refusal(status, message, code=_CODE.get(code) or CODES.get(status, "error"), headers=headers)
 
 
 def rows(response: Any) -> list[dict]:
@@ -126,3 +217,20 @@ def one(response: Any, missing: str = "Not found.") -> dict:
     if not data:
         raise HTTPException(status_code=404, detail=missing)
     return data
+
+
+def ts(value: Any) -> Optional[datetime]:
+    """A PostgREST timestamp (ISO 8601, maybe 'Z', maybe naive) as aware UTC."""
+    if value is None or isinstance(value, datetime):
+        return value if value is None or value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value).strip().replace(" ", "T", 1)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # Python before 3.11 takes only 0, 3 or 6 fractional digits.
+    head, dot, rest = text.partition(".")
+    if dot:
+        digits = "".join(ch for ch in rest if ch.isdigit())
+        tail = rest[len(digits):]
+        text = f"{head}.{(digits + '000000')[:6]}{tail}"
+    out = datetime.fromisoformat(text)
+    return out if out.tzinfo else out.replace(tzinfo=timezone.utc)

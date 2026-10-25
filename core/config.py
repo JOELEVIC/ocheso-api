@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     # Without it the API still runs; only play is refused.
     REFEREE_SECRET: str = ""
 
+    # Mail for invitations and organiser notices (core/mail.py), sent through
+    # Resend from the autopilot tick. Both optional: without them mail stays
+    # queued in the database (private.mail_outbox) and /health says "mail: off",
+    # so nothing claims an invitation went out when it did not. This is a
+    # Resend key, never a Supabase one - sign-in codes are Supabase Auth's own
+    # SMTP and never pass through this API.
+    RESEND_API_KEY: str = ""
+    # A verified sender, e.g. "Ocheso <invites@ocheso.com>". The display name is
+    # replaced per organisation ("Yoursite via Ocheso"); the address is kept.
+    MAIL_FROM: str = ""
+    RESEND_API_URL: str = "https://api.resend.com"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @model_validator(mode="after")
@@ -54,6 +66,10 @@ class Settings(BaseSettings):
     @property
     def origins(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def mail_on(self) -> bool:
+        return bool(self.RESEND_API_KEY and self.MAIL_FROM)
 
 
 def _is_privileged(key: str) -> bool:

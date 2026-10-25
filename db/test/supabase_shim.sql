@@ -60,3 +60,63 @@ create or replace function realtime.send(payload jsonb, event text, topic text, 
 returns void language sql as $$
   insert into realtime.sent (topic, event, payload, private) values (topic, event, payload, private);
 $$;
+
+-- Auth's sign-in bookkeeping, which db/platforms.sql claims email invites
+-- from: a confirmed address and each sign-in. Tests set them by hand the way
+-- GoTrue would (confirming the code, signing in again).
+alter table auth.users add column if not exists email_confirmed_at timestamptz;
+alter table auth.users add column if not exists last_sign_in_at    timestamptz;
+alter table auth.users add column if not exists created_at         timestamptz not null default now();
+
+-- Realtime Authorization reads private broadcasts through RLS on this table,
+-- with the channel's topic in realtime.topic(). Only the columns the policy in
+-- db/platforms.sql names.
+create table if not exists realtime.messages (
+  id          bigserial primary key,
+  topic       text not null,
+  extension   text not null default 'broadcast',
+  event       text,
+  payload     jsonb,
+  private     boolean not null default true,
+  inserted_at timestamptz not null default now()
+);
+alter table realtime.messages enable row level security;
+grant usage on schema realtime to anon, authenticated;
+grant select on realtime.messages to anon, authenticated;
+create or replace function realtime.topic() returns text language sql stable as $$
+  select nullif(current_setting('realtime.topic', true), '')
+$$;
+grant execute on function realtime.topic() to anon, authenticated;
+
+-- pg_net, recorded instead of sent: net.http_post() files the request in
+-- net.sent and returns its id, as the real one does; a test plays the remote
+-- server by writing net._http_response, which is where pg_net puts answers.
+create schema if not exists net;
+create table if not exists net.sent (
+  id                   bigserial primary key,
+  url                  text not null,
+  body                 jsonb,
+  headers              jsonb,
+  timeout_milliseconds int,
+  at                   timestamptz not null default now()
+);
+create table if not exists net._http_response (
+  id           bigint primary key,
+  status_code  int,
+  content_type text,
+  headers      jsonb,
+  content      text,
+  timed_out    boolean,
+  error_msg    text,
+  created      timestamptz not null default now()
+);
+create or replace function net.http_post(
+  url text,
+  body jsonb default '{}'::jsonb,
+  params jsonb default '{}'::jsonb,
+  headers jsonb default '{"Content-Type": "application/json"}'::jsonb,
+  timeout_milliseconds int default 5000
+) returns bigint language sql as $$
+  insert into net.sent (url, body, headers, timeout_milliseconds)
+  values (url, body, headers, timeout_milliseconds) returning id;
+$$;

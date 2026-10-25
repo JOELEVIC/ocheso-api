@@ -118,9 +118,17 @@ check(
 # once db/play.sql is applied - its scoreboard and the server clock.
 # The agent_machine_* functions are how platforms reach agents through the
 # API; they refuse anything the API did not sign (db/test/test_agents.py).
+# Once db/platforms.sql is applied: the public faces embeds and hosted pages
+# show (an organisation, its schedule, a series' current event, names, live
+# topics, frame policy, an invite's masked preview) and the three signed
+# dispatchers, which refuse anything the API did not sign
+# (db/test/test_platforms.py).
 ANON_CALLABLE = {"get_roster", "get_tournament", "get_results", "server_now",
                  "agent_machine_key", "agent_machine_use", "agent_machine_open",
-                 "agent_machine_session", "agent_machine_record", "agent_machine_end"}
+                 "agent_machine_session", "agent_machine_record", "agent_machine_end",
+                 "get_people", "get_live_topic", "get_game_topic", "get_embed_policy", "get_org_public",
+                 "get_org_schedule", "get_series_current", "get_invite_preview",
+                 "embed_call", "org_call", "system_call"}
 check(
     "no public function an anonymous visitor can call except the read paths",
     set(value("select string_agg(p.proname, ',' order by p.proname) from pg_proc p "

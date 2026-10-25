@@ -16,6 +16,22 @@ class ProfileOut(BaseModel):
     checkers_rating: int
     created_at: datetime
     updated_at: datetime
+    # 'account' (signed up) or 'member' (a platform's user, no sign-in).
+    kind: Optional[str] = None
+
+
+class Claimed(BaseModel):
+    slug: str
+    title: str
+    starts_at: Optional[datetime] = None
+    # {slug, name} of the organisation that entered you, or null for a personal event.
+    org: Optional[dict] = None
+
+
+class MeOut(ProfileOut):
+    # Tournaments you were just entered in from invites to this address
+    # (claim_my_invites), for "Yoursite entered you in X".
+    claimed: list[Claimed] = []
 
 
 class ProfileUpdate(BaseModel):

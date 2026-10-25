@@ -7,17 +7,25 @@ with the rules engine (play/rules.py), and hands the database a signed ruling
 right player, the right ply, time on the clock - so this module never has to
 be trusted with that, and a client calling the database directly gets nothing
 it could not get through here.
+
+The judgement itself lives in play/service.py, shared with the embed
+(routers/embed.py) and the autopilot (autopilot.py); this module reads as the
+caller and signs as the caller.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Header, HTTPException
+from postgrest import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
+import autopilot
 from db import CallerDb, UserDb, one, rows
-from play import pairing, rules, standings
+from lookups import needs_platforms, optional_rpc
+from play import pairing, service, standings
 from play.referee import caller_id, sign
 from routers.tournaments import find
 
@@ -51,36 +59,26 @@ class ResultIn(BaseModel):
     result: Literal["white", "black", "draw", "none"]
 
 
+class ExtendIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # "+5 min break" on the autopilot card; added to any hold already set.
+    minutes: int = Field(5, ge=1, le=120)
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 def _variant(t: dict) -> str:
-    return "standard" if t["game"] == "chess" else t["variant"]
+    return service.variant(t)
 
 
 def _seeds(db, slug: str) -> list[pairing.Seed]:
     """Approved players in seeding order: seed, then rating, then who came first."""
-    roster = rows(db.rpc("get_roster", {"p_slug": slug}).execute())
-    roster.sort(key=lambda p: (p.get("seed") or 10**6, -(p.get("rating_at_entry") or 0), p["joined_at"]))
-    return [pairing.Seed(p["user_id"], p.get("rating_at_entry") or 0) for p in roster]
+    return service.seeds_from_roster(rows(db.rpc("get_roster", {"p_slug": slug}).execute()))
 
 
 def _results(db, tournament_id: str) -> list[standings.Result]:
-    out = []
-    for g in rows(db.rpc("get_results", {"p_tournament": tournament_id}).execute()):
-        out.append(
-            standings.Result(
-                round=g["round_number"],
-                white=g["white_id"],
-                black=g["black_id"],
-                result=g["result"] if g["status"] == "finished" else None,
-                board=g["board"],
-                tiebreak_of=g["tiebreak_of"],
-                game_id=g["game_id"],
-                finished=g["status"] == "finished",
-            )
-        )
-    return out
+    return service.results_from_rows(rows(db.rpc("get_results", {"p_tournament": tournament_id}).execute()))
 
 
 def _people(db, ids) -> dict[str, dict]:
@@ -96,25 +94,11 @@ def _game(db, game_id: str) -> dict:
 
 def _history(db, game: dict) -> list[str]:
     moves = rows(db.table("moves").select("ply,move").eq("game_id", game["id"]).order("ply").execute())
-    if len(moves) != game["ply"]:
-        raise HTTPException(status_code=409, detail="The game record is still arriving. Try again.")
-    return [m["move"] for m in moves]
+    return service.history_of(game, moves)
 
 
 def _publish(db, by: str, t: dict, round_no: Optional[int], pairs: list[pairing.Pairing], start: bool) -> list[dict]:
-    begin = rules.start(t["game"], _variant(t))
-    games = [
-        {
-            "board": p.board or None,
-            "white": p.white,
-            "black": p.black,
-            "position": begin.position,
-            "turn": begin.turn,
-            "legal": begin.legal,
-            "tiebreak_of": p.tiebreak_of,
-        }
-        for p in pairs
-    ]
+    games = service.pairing_games(t, pairs)
     payload, sig = sign("pairings", by, {"tournament": t["id"], "round": round_no, "start": start, "games": games})
     return rows(db.rpc("publish_pairings", {"p_payload": payload, "p_sig": sig}).execute())
 
@@ -128,70 +112,19 @@ def list_rounds(slug: str, db: CallerDb):
     results = rows(db.rpc("get_results", {"p_tournament": t["id"]}).execute())
     # Round ids come from the table, which only staff and entrants of an
     # unlisted event can read; everyone else gets the status from the results.
-    meta = {r["number"]: r for r in rows(db.table("rounds").select("*").eq("tournament_id", t["id"]).execute())}
-    for g in results:
-        if g["round_number"] is not None and g["round_number"] not in meta:
-            meta[g["round_number"]] = {"id": None, "status": g["round_status"], "started_at": None}
+    round_rows = rows(db.table("rounds").select("*").eq("tournament_id", t["id"]).execute())
     names = _people(db, [g["white_id"] for g in results] + [g["black_id"] for g in results])
-    rounds: dict[Optional[int], list[dict]] = {}
-    for g in results:
-        rounds.setdefault(g["round_number"], []).append(
-            {
-                "id": g["game_id"],
-                "board": g["board"],
-                "white": names.get(g["white_id"]),
-                "black": names.get(g["black_id"]),
-                "status": g["status"],
-                "result": g["result"],
-                "termination": g["termination"],
-                "tiebreak_of": g["tiebreak_of"],
-            }
-        )
-    return [
-        {
-            "number": n,
-            "id": (meta.get(n) or {}).get("id"),
-            "status": (meta.get(n) or {}).get("status", "live" if n is None else "pending"),
-            "started_at": (meta.get(n) or {}).get("started_at"),
-            "games": games,
-        }
-        for n, games in sorted(rounds.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))
-    ]
+    return service.rounds_out(results, round_rows, names)
 
 
 @router.get("/v1/tournaments/{slug}/standings", summary="The table")
 def get_standings(slug: str, db: CallerDb):
     t = find(db, slug)
     seeds = _seeds(db, slug)
-    players = {s.id: s.rating for s in seeds}
     results = _results(db, t["id"])
-    for r in results:  # someone removed after playing still counts for others' tie-breaks
-        for who in (r.white, r.black):
-            if who and who not in players:
-                players[who] = 0
-    if t["format"] == "arena":
-        lines = standings.arena(players, results)
-    else:
-        lines = standings.table(players, results, t["tiebreaks"])
+    players, lines = service.standings_table(t, seeds, results)
     names = _people(db, players)
-    return {
-        "format": t["format"],
-        "tiebreaks": [] if t["format"] == "arena" else t["tiebreaks"],
-        "champion": pairing.knockout_champion(results) if t["format"] == "knockout" else None,
-        "lines": [
-            {
-                "rank": l.rank,
-                "player": names.get(l.player) or {"id": l.player},
-                "points": l.points,
-                "played": l.played,
-                "wins": l.wins,
-                "byes": l.byes,
-                "rating": l.rating,
-                "tiebreaks": l.tiebreaks,
-            }
-            for l in lines
-        ],
-    }
+    return service.standings_out(t, results, lines, names)
 
 
 @router.post("/v1/tournaments/{slug}/rounds/next", summary="Pair the next round (or a knockout's tie-breaks)")
@@ -202,52 +135,16 @@ def next_round(slug: str, body: NextIn, db: UserDb, authorization: Auth = None):
         raise HTTPException(status_code=409, detail="Start the tournament before pairing.")
     if t["format"] == "arena":
         raise HTTPException(status_code=409, detail="An arena pairs players as they become free.")
-    seeds = _seeds(db, slug)
-    history = _results(db, t["id"])
-    if any(r.result is None for r in history):
-        raise HTTPException(status_code=409, detail="Games in this round are still being played.")
-    latest = max((r.round or 0 for r in history), default=0)
-    try:
-        if t["format"] == "knockout":
-            round_no, pairs = pairing.knockout(seeds, history)
-        elif t["format"] == "round_robin":
-            if not history:
-                total = pairing.round_robin_rounds(len(seeds))
-            else:
-                # The field was fixed by round one; later withdrawals keep their slot.
-                total = pairing.round_robin_rounds(len({x for r in history if r.round == 1 for x in (r.white, r.black) if x}))
-            round_no = latest + 1
-            if round_no > total:
-                raise pairing.CannotPair("every round has been played")
-            if latest:
-                order = _rr_order(history, seeds)
-            else:
-                order = seeds
-            pairs = pairing.round_robin(order, round_no)
-        else:
-            round_no = latest + 1
-            if t["rounds_count"] and round_no > t["rounds_count"]:
-                raise pairing.CannotPair("every round has been played")
-            pairs = pairing.swiss(seeds, history, round_no)
-    except pairing.CannotPair as e:
-        raise HTTPException(status_code=409, detail=str(e).capitalize() + ".")
-    games = _publish(db, by, t, round_no, pairs, body.start)
-    return {"round": round_no, "games": len(games), "started": body.start}
+    plan = service.plan_round(t, _seeds(db, slug), _results(db, t["id"]))
+    if not isinstance(plan, service.Pair):
+        # Wait, Done and CannotPair all say why in the console's own words.
+        raise HTTPException(status_code=409, detail=plan.reason.capitalize() + ".")
+    games = _publish(db, by, t, plan.round, plan.pairs, body.start)
+    return {"round": plan.round, "games": len(games), "started": body.start}
 
 
 def _rr_order(history: list[standings.Result], seeds: list[pairing.Seed]) -> list[pairing.Seed]:
-    """The round robin's seating is fixed by its first round, so later rounds
-    use the same order even if someone has since withdrawn."""
-    first = sorted((r for r in history if r.round == 1), key=lambda r: r.board or 0)
-    ids = {s.id: s for s in seeds}
-    seen: list[str] = []
-    for r in first:
-        for who in (r.white, r.black):
-            if who and who not in seen:
-                seen.append(who)
-    by_seed = {s.id: i for i, s in enumerate(seeds)}
-    seen.sort(key=lambda pid: by_seed.get(pid, 10**6))
-    return [ids.get(pid, pairing.Seed(pid)) for pid in seen]
+    return service.rr_order(history, seeds)
 
 
 @router.post("/v1/rounds/{round_id}/start", summary="Start the clocks on a published round")
@@ -285,44 +182,8 @@ def my_games(db: UserDb, authorization: Auth = None):
 def make_move(game_id: str, body: MoveIn, db: UserDb, authorization: Auth = None):
     by = caller_id(authorization)
     g = _game(db, game_id)
-    if g["status"] != "live":
-        raise HTTPException(status_code=409, detail="This game is not in progress.")
-    # Said plainly before judging: "e7e5 is not legal here" is true when it is
-    # White's move, but "not your move" is what the player needs to hear. The
-    # database checks both again.
-    side = "white" if by == g["white_id"] else "black" if by == g["black_id"] else None
-    if side is None:
-        raise HTTPException(status_code=403, detail="You're not playing this game.")
-    if side != g["turn"]:
-        raise HTTPException(status_code=409, detail="It's not your move.")
-    if body.ply is not None and body.ply != g["ply"]:
-        raise HTTPException(status_code=409, detail="The position has moved on. Your board will catch up.")
-    t = g["tournament"]
-    history = _history(db, g)
-    # The record and the stored position must agree before anything is built on
-    # either: if they ever do not, stop rather than rule on the wrong board.
-    if rules.position_after(t["game"], _variant(t), history) != g["position"]:
-        raise HTTPException(status_code=500, detail="This game's record is inconsistent. An organiser has to look at it.")
-    try:
-        r = rules.judge(t["game"], _variant(t), history, body.move)
-    except rules.Illegal as e:
-        raise HTTPException(status_code=422, detail=str(e).capitalize() + ".")
-    payload, sig = sign(
-        "move",
-        by,
-        {
-            "game": game_id,
-            "ply": g["ply"],
-            "before": g["position"],
-            "move": r.move,
-            "san": r.san,
-            "after": r.after.position,
-            "turn": r.after.turn,
-            "legal": r.after.legal,
-            "result": r.result,
-            "termination": r.termination,
-        },
-    )
+    service.check_mover(g, by, body.ply)
+    payload, sig = sign("move", by, service.move_ruling(g, _history(db, g), body.move))
     return one(db.rpc("play_move", {"p_payload": payload, "p_sig": sig}).execute())
 
 
@@ -330,11 +191,8 @@ def make_move(game_id: str, body: MoveIn, db: UserDb, authorization: Auth = None
 def claim_flag(game_id: str, db: UserDb, authorization: Auth = None):
     by = caller_id(authorization)
     g = _game(db, game_id)
-    if g["status"] != "live":
-        raise HTTPException(status_code=409, detail="This game is not in progress.")
-    t = g["tournament"]
-    result = rules.flag_result(t["game"], _variant(t), _history(db, g))
-    payload, sig = sign("flag", by, {"game": game_id, "ply": g["ply"], "result": result})
+    service.check_live(g)
+    payload, sig = sign("flag", by, service.flag_ruling(g, _history(db, g)))
     return one(db.rpc("claim_flag", {"p_payload": payload, "p_sig": sig}).execute())
 
 
@@ -388,8 +246,7 @@ def arena_join(slug: str, db: UserDb, authorization: Auth = None):
     seeds = {s.id: s for s in _seeds(db, slug)}
     waiting = [seeds.get(i, pairing.Seed(i)) for i in waiting_ids]
     history = _results(db, t["id"])
-    scores = {l.player: l.points for l in standings.arena({s.id: s.rating for s in waiting}, history)}
-    pick = pairing.arena_pick(me, waiting, scores, history)
+    pick = pairing.arena_pick(me, waiting, service.arena_scores(waiting, history), history)
     if pick is None:
         return {"status": "waiting"}
     try:
@@ -405,3 +262,87 @@ def arena_leave(slug: str, db: UserDb):
     t = find(db, slug)
     db.rpc("arena_leave", {"p_tournament": t["id"]}).execute()
     return {"status": "left"}
+
+
+# -----------------------------------------------------------------------------
+# Autopilot, from the organiser's side (docs/OCHESO_PLATFORMS.md D1, F3). The
+# tick itself is routers/internal.py; these are the buttons on the autopilot
+# card. Each acts as the organiser - their token, their rights - so pressing
+# "Pair now" while the tick pairs the same round is the database's to settle:
+# one of the two gets a 409, and nothing is paired twice.
+# -----------------------------------------------------------------------------
+@router.get("/v1/tournaments/{slug}/autopilot", summary="What autopilot will do next, and what it did")
+def autopilot_status(slug: str, db: UserDb):
+    t = find(db, slug)
+    round_rows = rows(db.table("rounds").select("*").eq("tournament_id", t["id"]).execute())
+    results = rows(db.rpc("get_results", {"p_tournament": t["id"]}).execute())
+    entrants = len(rows(db.rpc("get_roster", {"p_slug": slug}).execute()))
+    # Organisers only (null for anyone else), and only with db/platforms.sql.
+    info = optional_rpc(db, "get_autopilot", {"p_tournament": t["id"]}) or {}
+    state = info.get("state") or {}
+    now = datetime.now(timezone.utc)
+    enabled = bool(t.get("autopilot"))
+    hold = state.get("hold_until") or state.get("next_check_at")
+    return {
+        "enabled": enabled,
+        "next": autopilot.next_step(t, round_rows, results, entrants, now, hold) if enabled else None,
+        "timeline": autopilot.timeline(t, round_rows, results, entrants, now),
+        "note": t.get("autopilot_note"),
+        "last_error": state.get("last_error"),
+        "last_action": state.get("last_action"),
+        "last_action_at": state.get("last_action_at"),
+        "hold_until": state.get("hold_until"),
+        "postponed": state.get("postponed"),
+        "due": info.get("due"),
+        # The switch the founder flips after deploying (private.platform_settings).
+        "platform_enabled": info.get("platform_enabled"),
+    }
+
+
+def _control(slug: str, db, action: str, minutes: Optional[int] = None) -> dict:
+    t = find(db, slug)
+    params = {"p_tournament": t["id"], "p_action": action}
+    if minutes is not None:
+        params["p_minutes"] = minutes
+    try:
+        return one(db.rpc("autopilot_control", params).execute())
+    except APIError as e:
+        needs_platforms(e)
+
+
+@router.post("/v1/tournaments/{slug}/autopilot/pause", summary="Pause autopilot (clocks still run out)")
+def autopilot_pause(slug: str, db: UserDb):
+    return _control(slug, db, "pause")
+
+
+@router.post("/v1/tournaments/{slug}/autopilot/resume", summary="Resume autopilot")
+def autopilot_resume(slug: str, db: UserDb):
+    return _control(slug, db, "resume")
+
+
+@router.post("/v1/tournaments/{slug}/autopilot/start-now", summary="Start now, and pair round one")
+def autopilot_start_now(slug: str, db: UserDb, authorization: Auth = None):
+    by = caller_id(authorization)
+    t = find(db, slug)
+    if t["status"] != "registration":
+        raise HTTPException(status_code=409, detail="Only a tournament taking entries can be started.")
+    # Pending invites lapse and free their seats as it goes live (the database's doing).
+    t = one(db.rpc("set_tournament_status", {"p_tournament": t["id"], "p_status": "live"}).execute())
+    if t["format"] == "arena":
+        return {"status": "live", "round": None, "games": 0}
+    plan = service.plan_round(t, _seeds(db, slug), _results(db, t["id"]))
+    if not isinstance(plan, service.Pair):
+        # Live but unpaired: say why. Autopilot (if on) tries again by itself.
+        return {"status": "live", "round": None, "games": 0, "reason": plan.reason.capitalize() + "."}
+    games = _publish(db, by, t, plan.round, plan.pairs, True)
+    return {"status": "live", "round": plan.round, "games": len(games)}
+
+
+@router.post("/v1/tournaments/{slug}/autopilot/pair-now", summary="Pair the next round now and start it")
+def autopilot_pair_now(slug: str, db: UserDb, authorization: Auth = None):
+    return next_round(slug, NextIn(start=True), db, authorization)
+
+
+@router.post("/v1/tournaments/{slug}/autopilot/extend-break", summary="Hold the next round a few minutes longer")
+def autopilot_extend_break(slug: str, db: UserDb, body: Optional[ExtendIn] = None):
+    return _control(slug, db, "extend-break", (body or ExtendIn()).minutes)

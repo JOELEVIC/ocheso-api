@@ -22,6 +22,13 @@
 --
 -- Clocks are this database's: the time a move takes is now() minus when the
 -- turn began, measured where nobody can lie about either.
+--
+-- ONE RULEBOOK, SEVERAL WAYS IN. Each rule lives in a private.do_* function
+-- that is told who is acting: the signed-in caller (the public functions
+-- here, which pass auth.uid() and keep their old signatures), a player in an
+-- embed whose session the API proved, or the autopilot (both through the
+-- signed dispatchers in db/platforms.sql). Nobody can name the actor: the
+-- wrappers take it from the token, the dispatchers from a verified session.
 -- =============================================================================
 
 do $$ begin
@@ -200,21 +207,40 @@ $$;
 -- move each - a no-show flag or a first-move resignation says nothing about
 -- strength, and an arbiter's result (a forfeit, a correction) is not a game.
 -- Corrections to a finished result do not re-rate.
+--
+-- Whose ratings (docs/OCHESO_PLATFORMS.md, A9):
+--   * two accounts: their global ratings, and only in a `rated` tournament -
+--     an organisation's events are unrated unless the organiser opts in;
+--   * two members: theirs, which are their organisation's own, since a member
+--     belongs to one organisation and plays nobody outside it;
+--   * an account against a member: nobody. Neither scale can price the other.
 create or replace function private.rate(g public.games)
 returns void language plpgsql security definer set search_path = public, extensions as $$
 declare
-  kind text;
-  rw   int;
-  rb   int;
-  ew   numeric;
-  sw   numeric;
+  gtype    text;
+  is_rated boolean;
+  wkind    text;
+  bkind    text;
+  rw       int;
+  rb       int;
+  ew       numeric;
+  sw       numeric;
 begin
   if g.black_id is null or g.result not in ('white', 'black', 'draw')
      or g.termination in ('arbiter', 'bye') or g.ply < 2 then
     return;
   end if;
-  select game::text into kind from tournaments where id = g.tournament_id;
-  if kind = 'chess' then
+  select game::text, rated into gtype, is_rated from tournaments where id = g.tournament_id;
+  select p.kind into wkind from profiles p where p.id = g.white_id;
+  select p.kind into bkind from profiles p where p.id = g.black_id;
+  if wkind = 'account' and bkind = 'account' then
+    if not is_rated then
+      return;
+    end if;
+  elsif not (wkind = 'member' and bkind = 'member') then
+    return;
+  end if;
+  if gtype = 'chess' then
     select chess_rating into rw from profiles where id = g.white_id;
     select chess_rating into rb from profiles where id = g.black_id;
   else
@@ -225,7 +251,7 @@ begin
   sw := case g.result when 'white' then 1 when 'black' then 0 else 0.5 end;
   rw := greatest(100, least(3500, rw + round((case when rw < 2100 then 32 when rw < 2400 then 24 else 16 end) * (sw - ew))::int));
   rb := greatest(100, least(3500, rb + round((case when rb < 2100 then 32 when rb < 2400 then 24 else 16 end) * (ew - sw))::int));
-  if kind = 'chess' then
+  if gtype = 'chess' then
     update profiles set chess_rating = rw where id = g.white_id;
     update profiles set chess_rating = rb where id = g.black_id;
   else
@@ -277,18 +303,20 @@ revoke all on function private.close_round(uuid) from public, anon, authenticate
 -- -----------------------------------------------------------------------------
 -- Pairings: rounds, tie-breaks, arena games
 -- -----------------------------------------------------------------------------
--- The referee pairs; this checks the result is something the caller may
+-- The referee pairs; this checks the result is something the actor may
 -- publish and that every name in it is entitled to a board.
 --
--- payload: { kind: "pairings", by, exp, tournament, round (null for arena),
---            start: bool,
---            games: [{ board, white, black (null = bye), position, turn,
---                      legal, tiebreak_of }] }
-create or replace function public.publish_pairings(p_payload text, p_sig text)
+-- body: { tournament, round (null for arena), start: bool,
+--         games: [{ board, white, black (null = bye), position, turn,
+--                   legal, tiebreak_of }] }
+--
+-- Who may publish. A round: the tournament's managers, or the autopilot
+-- (p_system) on a tournament that has autopilot on. An arena game: one of its
+-- two players, or the autopilot. A session (an embed) is never a manager.
+create or replace function private.do_publish(body jsonb, p_actor uuid, p_system boolean, p_session uuid)
 returns setof public.games
 language plpgsql security definer set search_path = public, extensions as $$
 declare
-  body   jsonb := private.ruling(p_payload, p_sig, 'pairings');
   t      tournaments;
   r      rounds;
   item   jsonb;
@@ -304,6 +332,12 @@ begin
   if not found then
     raise exception 'no such tournament' using errcode = 'no_data_found';
   end if;
+  if p_session is not null then
+    perform private.session_may_touch(p_session, t.id);
+  end if;
+  if p_system and not t.autopilot then
+    raise exception 'autopilot is off for this tournament' using errcode = 'check_violation';
+  end if;
   if t.status <> 'live' then
     raise exception 'the tournament is not under way' using errcode = 'check_violation';
   end if;
@@ -316,7 +350,9 @@ begin
     end if;
     start := true;
   else
-    if not private.is_tournament_manager(t.id) then
+    if not (p_system
+            or (p_session is null and p_actor is not distinct from auth.uid()
+                and private.is_tournament_manager(t.id))) then
       raise exception 'no such tournament' using errcode = 'no_data_found';
     end if;
     select * into r from rounds where tournament_id = t.id and number = num for update;
@@ -353,7 +389,7 @@ begin
     end if;
 
     if t.format = 'arena' then
-      if b is null or auth.uid() not in (w, b) then
+      if b is null or (not p_system and (p_actor is null or p_actor not in (w, b))) then
         raise exception 'an arena game is made by one of its two players' using errcode = 'insufficient_privilege';
       end if;
       if exists (select 1 from games where tournament_id = t.id and status <> 'finished'
@@ -401,15 +437,26 @@ begin
   end if;
 end $$;
 
--- Starts the clocks on a round published without starting.
-create or replace function public.start_round(p_round uuid)
+-- payload: { kind: "pairings", by, exp, ...the body above }
+create or replace function public.publish_pairings(p_payload text, p_sig text)
+returns setof public.games
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return query select * from private.do_publish(private.ruling(p_payload, p_sig, 'pairings'), auth.uid(), false, null);
+end $$;
+
+-- Starts the clocks on a round published without starting: its managers, or
+-- the autopilot on a tournament that has it on.
+create or replace function private.do_start_round(p_round uuid, p_system boolean)
 returns public.rounds
 language plpgsql security definer set search_path = public, extensions as $$
 declare
   r rounds;
 begin
   select * into r from rounds where id = p_round for update;
-  if not found or not private.is_tournament_manager(r.tournament_id) then
+  if not found
+     or not (case when p_system then exists (select 1 from tournaments where id = r.tournament_id and autopilot)
+                  else private.is_tournament_manager(r.tournament_id) end) then
     raise exception 'no such round' using errcode = 'no_data_found';
   end if;
   update games set status = 'live', turn_started_at = now(), started_at = now()
@@ -420,16 +467,21 @@ begin
   return r;
 end $$;
 
+create or replace function public.start_round(p_round uuid)
+returns public.rounds
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_start_round(p_round, false);
+end $$;
+
 -- -----------------------------------------------------------------------------
 -- Playing
 -- -----------------------------------------------------------------------------
--- payload: { kind: "move", by, exp, game, ply, before, move, san, after, turn,
---            legal, result?, termination? }
-create or replace function public.play_move(p_payload text, p_sig text)
+-- body: { game, ply, before, move, san, after, turn, legal, result?, termination? }
+create or replace function private.do_move(body jsonb, p_actor uuid, p_session uuid)
 returns public.games
 language plpgsql security definer set search_path = public, extensions as $$
 declare
-  body jsonb := private.ruling(p_payload, p_sig, 'move');
   g    games;
   side text;
   remaining int;
@@ -438,10 +490,13 @@ begin
   if not found then
     raise exception 'no such game' using errcode = 'no_data_found';
   end if;
+  if p_session is not null then
+    perform private.session_may_touch(p_session, g.tournament_id);
+  end if;
   if g.status <> 'live' then
     raise exception 'this game is not in progress' using errcode = 'check_violation';
   end if;
-  side := private.side_of(g, auth.uid());
+  side := private.side_of(g, p_actor);
   if side is null then
     raise exception 'you are not playing this game' using errcode = 'insufficient_privilege';
   end if;
@@ -479,23 +534,37 @@ begin
   return g;
 end $$;
 
+-- payload: { kind: "move", by, exp, ...the body above }
+create or replace function public.play_move(p_payload text, p_sig text)
+returns public.games
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_move(private.ruling(p_payload, p_sig, 'move'), auth.uid(), null);
+end $$;
+
 -- The side to move has run out of time. Anyone in the game, or running the
--- tournament, may say so; this checks it against its own clock. The referee
--- rules on the result, because "out of time" is a draw when the opponent could
--- never have won.
--- payload: { kind: "flag", by, exp, game, ply, result }
-create or replace function public.claim_flag(p_payload text, p_sig text)
+-- tournament, may say so - or the autopilot, which sweeps every live game
+-- (p_system: no identity, but the same clock and the same results). This
+-- checks it against its own clock. The referee rules on the result, because
+-- "out of time" is a draw when the opponent could never have won.
+-- body: { game, ply, result }
+create or replace function private.do_flag(body jsonb, p_actor uuid, p_system boolean, p_session uuid)
 returns public.games
 language plpgsql security definer set search_path = public, extensions as $$
 declare
-  body jsonb := private.ruling(p_payload, p_sig, 'flag');
   g    games;
 begin
   select * into g from games where id = (body ->> 'game')::uuid for update;
   if not found then
     raise exception 'no such game' using errcode = 'no_data_found';
   end if;
-  if private.side_of(g, auth.uid()) is null and not private.is_tournament_staff(g.tournament_id) then
+  if p_session is not null then
+    perform private.session_may_touch(p_session, g.tournament_id);
+  end if;
+  if not p_system
+     and private.side_of(g, p_actor) is null
+     and not (p_session is null and p_actor is not distinct from auth.uid()
+              and private.is_tournament_staff(g.tournament_id)) then
     raise exception 'no such game' using errcode = 'no_data_found';
   end if;
   if g.status <> 'live' then
@@ -507,13 +576,22 @@ begin
   if private.time_left(g) > 0 then
     raise exception 'there is still time on the clock' using errcode = 'check_violation';
   end if;
-  if body ->> 'result' not in (case g.turn when 'white' then 'black' else 'white' end, 'draw') then
+  if body ->> 'result' is null
+     or body ->> 'result' not in (case g.turn when 'white' then 'black' else 'white' end, 'draw') then
     raise exception 'that is not a result of running out of time' using errcode = 'check_violation';
   end if;
   return private.finish_game(g.id, (body ->> 'result')::public.game_result, 'timeout');
 end $$;
 
-create or replace function public.resign(p_game uuid)
+-- payload: { kind: "flag", by, exp, game, ply, result }
+create or replace function public.claim_flag(p_payload text, p_sig text)
+returns public.games
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_flag(private.ruling(p_payload, p_sig, 'flag'), auth.uid(), false, null);
+end $$;
+
+create or replace function private.do_resign(p_game uuid, p_actor uuid, p_session uuid)
 returns public.games
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -521,7 +599,10 @@ declare
   side text;
 begin
   select * into g from games where id = p_game for update;
-  side := case when found then private.side_of(g, auth.uid()) end;
+  if found and p_session is not null then
+    perform private.session_may_touch(p_session, g.tournament_id);
+  end if;
+  side := case when found then private.side_of(g, p_actor) end;
   if side is null then
     raise exception 'no such game' using errcode = 'no_data_found';
   end if;
@@ -531,8 +612,15 @@ begin
   return private.finish_game(g.id, (case side when 'white' then 'black' else 'white' end)::public.game_result, 'resignation');
 end $$;
 
+create or replace function public.resign(p_game uuid)
+returns public.games
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_resign(p_game, auth.uid(), null);
+end $$;
+
 -- Offer a draw, or accept the one on the table.
-create or replace function public.offer_draw(p_game uuid)
+create or replace function private.do_offer_draw(p_game uuid, p_actor uuid, p_session uuid)
 returns public.games
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -540,7 +628,10 @@ declare
   side text;
 begin
   select * into g from games where id = p_game for update;
-  side := case when found then private.side_of(g, auth.uid()) end;
+  if found and p_session is not null then
+    perform private.session_may_touch(p_session, g.tournament_id);
+  end if;
+  side := case when found then private.side_of(g, p_actor) end;
   if side is null then
     raise exception 'no such game' using errcode = 'no_data_found';
   end if;
@@ -554,7 +645,14 @@ begin
   return g;
 end $$;
 
-create or replace function public.decline_draw(p_game uuid)
+create or replace function public.offer_draw(p_game uuid)
+returns public.games
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_offer_draw(p_game, auth.uid(), null);
+end $$;
+
+create or replace function private.do_decline_draw(p_game uuid, p_actor uuid, p_session uuid)
 returns public.games
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -562,13 +660,29 @@ declare
   side text;
 begin
   select * into g from games where id = p_game for update;
-  side := case when found then private.side_of(g, auth.uid()) end;
+  if found and p_session is not null then
+    perform private.session_may_touch(p_session, g.tournament_id);
+  end if;
+  side := case when found then private.side_of(g, p_actor) end;
   if side is null then
     raise exception 'no such game' using errcode = 'no_data_found';
   end if;
   update games set draw_offer = null where id = g.id and draw_offer is not null and draw_offer <> side
   returning * into g;
+  -- Nothing to decline (no offer, or it was your own): RETURNING INTO set g to
+  -- a row of nulls, which clients read as a game with no ply. Answer with the
+  -- game as it stands instead.
+  if not found then
+    select * into g from games where id = p_game;
+  end if;
   return g;
+end $$;
+
+create or replace function public.decline_draw(p_game uuid)
+returns public.games
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_decline_draw(p_game, auth.uid(), null);
 end $$;
 
 -- The arbiter's word: forfeits, corrections, a game played over the board.
@@ -596,7 +710,7 @@ end $$;
 -- -----------------------------------------------------------------------------
 -- Arena queue
 -- -----------------------------------------------------------------------------
-create or replace function public.arena_join(p_tournament uuid)
+create or replace function private.do_arena_join(p_tournament uuid, p_actor uuid, p_session uuid)
 returns public.arena_queue
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -604,7 +718,10 @@ declare
   row arena_queue;
 begin
   select * into t from tournaments where id = p_tournament;
-  if not found or not exists (select 1 from participants where tournament_id = t.id and user_id = auth.uid()
+  if found and p_session is not null then
+    perform private.session_may_touch(p_session, t.id);
+  end if;
+  if not found or not exists (select 1 from participants where tournament_id = t.id and user_id = p_actor
                                                           and status = 'approved') then
     raise exception 'no such tournament' using errcode = 'no_data_found';
   end if;
@@ -613,20 +730,50 @@ begin
     raise exception 'the arena is not open' using errcode = 'check_violation';
   end if;
   if exists (select 1 from games where tournament_id = t.id and status <> 'finished'
-              and auth.uid() in (white_id, black_id)) then
+              and p_actor in (white_id, black_id)) then
     raise exception 'finish your game first' using errcode = 'check_violation';
   end if;
-  insert into arena_queue (tournament_id, user_id) values (t.id, auth.uid())
+  insert into arena_queue (tournament_id, user_id) values (t.id, p_actor)
   on conflict (tournament_id, user_id) do update set since = arena_queue.since
   returning * into row;
   return row;
 end $$;
 
+create or replace function public.arena_join(p_tournament uuid)
+returns public.arena_queue
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return private.do_arena_join(p_tournament, auth.uid(), null);
+end $$;
+
+create or replace function private.do_arena_leave(p_tournament uuid, p_actor uuid, p_session uuid)
+returns void
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if p_session is not null then
+    perform private.session_may_touch(p_session, p_tournament);
+  end if;
+  delete from arena_queue where tournament_id = p_tournament and user_id = p_actor;
+end $$;
+
+-- Was SQL; plpgsql now, like the other wrappers (CREATE OR REPLACE may change
+-- a function's language, never its signature - and this keeps it).
 create or replace function public.arena_leave(p_tournament uuid)
 returns void
-language sql security definer set search_path = public, extensions as $$
-  delete from arena_queue where tournament_id = p_tournament and user_id = auth.uid();
-$$;
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  perform private.do_arena_leave(p_tournament, auth.uid(), null);
+end $$;
+
+revoke all on function private.do_publish(jsonb, uuid, boolean, uuid) from public, anon, authenticated;
+revoke all on function private.do_start_round(uuid, boolean) from public, anon, authenticated;
+revoke all on function private.do_move(jsonb, uuid, uuid) from public, anon, authenticated;
+revoke all on function private.do_flag(jsonb, uuid, boolean, uuid) from public, anon, authenticated;
+revoke all on function private.do_resign(uuid, uuid, uuid) from public, anon, authenticated;
+revoke all on function private.do_offer_draw(uuid, uuid, uuid) from public, anon, authenticated;
+revoke all on function private.do_decline_draw(uuid, uuid, uuid) from public, anon, authenticated;
+revoke all on function private.do_arena_join(uuid, uuid, uuid) from public, anon, authenticated;
+revoke all on function private.do_arena_leave(uuid, uuid, uuid) from public, anon, authenticated;
 
 -- Results for standings and pairings, without positions or moves. Visible
 -- wherever the player list is - get_roster's rule: anyone who can open the

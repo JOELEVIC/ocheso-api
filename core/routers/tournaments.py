@@ -15,11 +15,13 @@ from fastapi import APIRouter, HTTPException, Query, Response
 
 from config import settings
 from db import CallerDb, UserDb, one, rows
+from lookups import org_by_slug
 from schemas.tournament import (
     AccessOut,
     EntryCodeIn,
     MyTournament,
     TournamentCreate,
+    TournamentFields,
     TournamentOut,
     TournamentUpdate,
 )
@@ -67,7 +69,22 @@ def mine(db: UserDb):
 
 @router.post("", response_model=TournamentOut, status_code=201, summary="Create a tournament")
 def create(body: TournamentCreate, db: UserDb):
-    data = body.model_dump(mode="json", exclude={"entry_code"}, exclude_none=True)
+    org_id = org_by_slug(db, body.org)["id"] if body.org else None
+    return insert(db, body, org_id)
+
+
+def insert(db, body: TournamentFields, org_id: Optional[str] = None, extra: Optional[dict] = None) -> dict:
+    """Create a tournament as the caller - for the console, an organisation's
+    Studio and the onboarding bootstrap alike."""
+    data = body.model_dump(mode="json", exclude={"entry_code", "org"}, exclude_none=True)
+    if org_id:
+        # Insert-only by column grant: the database also checks the caller
+        # may run events for this organisation.
+        data["org_id"] = org_id
+        # A9: an organisation's events don't move global ratings unless the
+        # organiser chose that.
+        data.setdefault("rated", False)
+    data.update(extra or {})
     # No owner_id: the database sets it to the caller and will not take one
     # from anywhere else.
     created = one(db.table("tournaments").insert(data).execute())

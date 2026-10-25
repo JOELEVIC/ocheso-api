@@ -6,7 +6,7 @@
       "root": "core/",
       "framework": "fastapi",
       "entrypoint": "main:app",
-      "functions": { "main.py": { "regions": ["dub1"] } }
+      "functions": { "main.py": { "regions": ["dub1"], "maxDuration": 60 } }
     },
     "agents": {
       "root": ".",

@@ -20,6 +20,12 @@ Variant = Literal["standard", "international", "brazilian"]
 Format = Literal["swiss", "round_robin", "knockout", "arena"]
 Status = Literal["draft", "registration", "live", "finished", "archived"]
 Tiebreak = Literal["buchholz", "buchholz_cut1", "sonneborn_berger", "direct_encounter", "wins", "progressive"]
+# Who can play (docs/OCHESO_PLATFORMS.md A3): Ocheso accounts, the
+# organisation's own platform users, or both. Only an organisation has
+# platform users, so a personal tournament is always "accounts".
+IdentityMode = Literal["accounts", "platform", "any"]
+ShortField = Literal["postpone", "wait", "cancel"]
+Language = Literal["en", "fr", "both"]
 
 _VARIANTS: dict[str, set[str]] = {"chess": {"standard"}, "checkers": {"international", "brazilian"}}
 
@@ -28,7 +34,11 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class TournamentCreate(_Strict):
+class TournamentFields(_Strict):
+    """Everything a new tournament may say about itself. TournamentCreate adds
+    the organisation (by slug) for the console; the platform API and the
+    onboarding bootstrap know the organisation already."""
+
     title: str = Field(min_length=3, max_length=120)
     description: Optional[str] = Field(None, max_length=2000)
     game: Game
@@ -50,8 +60,23 @@ class TournamentCreate(_Strict):
     # organisers only. Accepted here so creating a coded event is one request.
     entry_code: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9]{4,12}$")
 
+    # Ocheso for Platforms (db/schema.sql, C2). Omitted means the database's
+    # default - except `rated`, which an organisation's event leaves off
+    # unless the organiser opts in (A9; routers/tournaments.py).
+    identity_mode: Optional[IdentityMode] = None
+    invite_only: Optional[bool] = None
+    org_listed: Optional[bool] = None
+    rated: Optional[bool] = None
+    autopilot: Optional[bool] = None
+    min_players: Optional[int] = Field(None, ge=2, le=4096)
+    short_field: Optional[ShortField] = None
+    postpone_min: Optional[int] = Field(None, ge=1, le=1440)
+    max_postpones: Optional[int] = Field(None, ge=0, le=50)
+    round_break_s: Optional[int] = Field(None, ge=0, le=3600)
+    language: Optional[Language] = None
+
     @model_validator(mode="after")
-    def _coherent(self) -> "TournamentCreate":
+    def _coherent(self) -> "TournamentFields":
         if self.variant not in _VARIANTS[self.game]:
             raise ValueError(f"{self.game} is played as {', '.join(sorted(_VARIANTS[self.game]))}, not {self.variant}.")
         if (self.format == "arena") != (self.arena_minutes is not None):
@@ -69,6 +94,20 @@ class TournamentCreate(_Strict):
             # event is protected while anyone can walk in. Found on the live
             # database, 2026-10-21.
             raise ValueError("An entry_code only gates entry when requires_code is true.")
+        if self.min_players and self.max_participants and self.min_players > self.max_participants:
+            raise ValueError("min_players can't be more than max_participants.")
+        return self
+
+
+class TournamentCreate(TournamentFields):
+    # The organisation's slug. You must be its owner, an admin or staff; the
+    # database checks (the org_id column grant and the tournaments insert policy).
+    org: Optional[str] = Field(None, min_length=3, max_length=40)
+
+    @model_validator(mode="after")
+    def _identity_needs_org(self) -> "TournamentCreate":
+        if self.identity_mode not in (None, "accounts") and not self.org:
+            raise ValueError("Only an organisation's tournament can admit platform users: set org.")
         return self
 
 
@@ -89,6 +128,19 @@ class TournamentUpdate(_Strict):
     games_watchable: Optional[bool] = None
     requires_code: Optional[bool] = None
     auto_approve: Optional[bool] = None
+    # Frozen by the database once anyone has entered or entries have closed
+    # (guard_tournament_identity): identity_mode and rated.
+    identity_mode: Optional[IdentityMode] = None
+    rated: Optional[bool] = None
+    invite_only: Optional[bool] = None
+    org_listed: Optional[bool] = None
+    language: Optional[Language] = None
+    autopilot: Optional[bool] = None
+    min_players: Optional[int] = Field(None, ge=2, le=4096)
+    short_field: Optional[ShortField] = None
+    postpone_min: Optional[int] = Field(None, ge=1, le=1440)
+    max_postpones: Optional[int] = Field(None, ge=0, le=50)
+    round_break_s: Optional[int] = Field(None, ge=0, le=3600)
 
 
 class Person(BaseModel):
@@ -125,6 +177,21 @@ class TournamentOut(BaseModel):
     started_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    # Ocheso for Platforms. Optional so a database without them still answers.
+    org_id: Optional[str] = None
+    identity_mode: Optional[IdentityMode] = None
+    invite_only: Optional[bool] = None
+    org_listed: Optional[bool] = None
+    rated: Optional[bool] = None
+    autopilot: Optional[bool] = None
+    min_players: Optional[int] = None
+    short_field: Optional[ShortField] = None
+    postpone_min: Optional[int] = None
+    max_postpones: Optional[int] = None
+    round_break_s: Optional[int] = None
+    autopilot_note: Optional[str] = None
+    series_id: Optional[str] = None
+    language: Optional[Language] = None
 
 
 class MyTournament(BaseModel):

@@ -33,7 +33,9 @@ class ParticipantOut(BaseModel):
     status: ParticipantStatus
     rating_at_entry: Optional[int] = None
     seed: Optional[int] = None
-    joined_via: Literal["open", "code", "invite", "added"]
+    # 'email': claimed from an emailed invite; 'platform': a member profile
+    # entered through its organisation's platform (db/schema.sql).
+    joined_via: Literal["open", "code", "invite", "added", "email", "platform"]
     decided_by: Optional[str] = None
     decided_at: Optional[datetime] = None
     created_at: datetime

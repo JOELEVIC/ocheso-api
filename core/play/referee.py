@@ -53,11 +53,16 @@ def sign(kind: str, by: str, body: dict[str, Any]) -> tuple[str, str]:
     return payload, sig
 
 
-def sign_request(kind: str, body: dict[str, Any]) -> tuple[str, str]:
+def sign_request(kind: str, body: dict[str, Any],
+                 off: str = "Agents aren't switched on yet: the API has no signing key.") -> tuple[str, str]:
     """A request made for a platform holding an agent key (db/agents.sql). No
-    `by`: a platform has no account. The database checks the key inside it."""
+    `by`: a platform has no account. The database checks the key inside it.
+
+    The same envelope carries the platform dispatchers (db/platforms.sql
+    embed_call, org_call, system_call; see db.py), each saying in `off` what is
+    unavailable while the key is missing."""
     if not settings.REFEREE_SECRET:
-        raise HTTPException(status_code=503, detail="Agents aren't switched on yet: the API has no signing key.")
+        raise HTTPException(status_code=503, detail=off)
     payload = json.dumps({**body, "kind": kind, "exp": int(time.time()) + TTL_SECONDS},
                          separators=(",", ":"), sort_keys=True)
     sig = hmac.new(settings.REFEREE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()

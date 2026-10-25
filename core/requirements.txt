@@ -8,3 +8,8 @@ pydantic-settings>=2.2.0
 python-dotenv>=1.0.1
 chess>=1.11.0
 networkx>=3.3
+# Resend, for invitation and organiser mail (core/mail.py). Pure Python.
+httpx>=0.27.0
+# The IANA zones for invitation dates in the organiser's timezone, on a
+# runtime that may ship without /usr/share/zoneinfo.
+tzdata>=2024.1

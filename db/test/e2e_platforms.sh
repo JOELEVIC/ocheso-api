@@ -1,0 +1,38 @@
+#!/bin/sh
+# Ocheso for Platforms end to end, locally: a throwaway database (the shim,
+# then all four files in db/apply.sh's order), PostgREST, and the whole API
+# in-process (db/test/e2e_platforms.py). The autopilot's ticks are made by the
+# database itself - private.autopilot_kick() signs them into the shim's
+# net.sent - and replayed to the API byte for byte. Local only.
+#
+#   PG="-h 127.0.0.1 -p 55434 -U postgres" PYTHON=python3 db/test/e2e_platforms.sh
+set -eu
+cd "$(dirname "$0")/../.."
+PG=${PG:-"-h 127.0.0.1 -p 55434 -U postgres"}
+PYTHON=${PYTHON:-python3}
+DBNAME=ocheso_e2e_platforms
+PORT=${E2E_PORT:-3012}
+SECRET="e2e-local-only-secret-$(date +%s)-not-for-anything-real"
+
+dropdb $PG --if-exists $DBNAME
+createdb $PG $DBNAME
+# The whole database, as production has it: the shim, then every file in
+# db/apply.sh's order, each in its own transaction.
+psql $PG -d $DBNAME -X -q -v ON_ERROR_STOP=1 -f db/test/supabase_shim.sql >/dev/null 2>&1
+db/apply.sh $PG -d $DBNAME >/dev/null
+psql $PG -d $DBNAME -X -q -c "do \$\$ begin create role authenticator login noinherit; exception when duplicate_object then null; end \$\$; grant anon, authenticated to authenticator;"
+
+HOST=$(echo "$PG" | sed -E 's/.*-h ([^ ]+).*/\1/')
+PGPORT=$(echo "$PG" | sed -E 's/.*-p ([^ ]+).*/\1/')
+URI="postgresql://authenticator@/$DBNAME?host=$HOST&port=$PGPORT"
+
+PGRST_DB_URI="$URI" PGRST_DB_SCHEMAS=public PGRST_DB_ANON_ROLE=anon \
+  PGRST_JWT_SECRET="$SECRET" PGRST_SERVER_PORT=$PORT PGRST_LOG_LEVEL=crit \
+  postgrest >/tmp/ocheso-e2e-platforms-postgrest.log 2>&1 &
+PID=$!
+trap 'kill $PID 2>/dev/null' EXIT
+sleep 2
+
+export E2E_DB="postgresql://postgres@/$DBNAME?host=$HOST&port=$PGPORT" E2E_JWT_SECRET="$SECRET" \
+  E2E_REST="http://127.0.0.1:$PORT"
+$PYTHON db/test/e2e_platforms.py

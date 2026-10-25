@@ -176,6 +176,8 @@ denied("the same ruling cannot be played twice", f"select ply from play_move({ru
 allowed("Black offers a draw", f"select draw_offer from offer_draw('{G1}')", B, "black")
 denied("a stranger cannot accept it", f"select draw_offer from offer_draw('{G1}')", STRANGER, "no such game")
 allowed("White declines", f"select coalesce(draw_offer, 'none') from decline_draw('{G1}')", A, "none")
+allowed("declining with no offer answers with the game, not a row of nulls",
+        f"select (id = '{G1}')::text || ' ' || ply from decline_draw('{G1}')", A, "true 1")
 allowed("Black offers again", f"select draw_offer from offer_draw('{G1}')", B, "black")
 allowed("White accepts by offering back", f"select result || ' ' || termination from offer_draw('{G1}')", A, "draw agreement")
 check("the game is over and its clocks have stopped", value(f"select status from games where id = '{G1}'") == "finished")

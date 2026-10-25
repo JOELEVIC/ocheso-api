@@ -242,8 +242,15 @@ def test_other_origins_may_not():
     assert "access-control-allow-origin" not in _preflight("https://evil.example").headers
 
 
-def test_health_claims_only_what_it_checks():
-    assert client.get("/health").json() == {"ok": True, "service": "ocheso-api"}
+@pytest.mark.parametrize("key,sender,mail", [("", "", "off"), ("re_test", "", "off"), ("re_test", "Ocheso <a@b.co>", "on")])
+def test_health_claims_only_what_it_checks(monkeypatch, key, sender, mail):
+    # `mail` says whether this process can send - both Resend settings - and
+    # nothing about whether anything was sent. Still no claim about the database.
+    from config import settings
+
+    monkeypatch.setattr(settings, "RESEND_API_KEY", key)
+    monkeypatch.setattr(settings, "MAIL_FROM", sender)
+    assert client.get("/health").json() == {"ok": True, "service": "ocheso-api", "mail": mail}
 
 
 def test_rows_takes_a_single_row_function_result():
@@ -256,3 +263,88 @@ def test_rows_takes_a_single_row_function_result():
     assert rows(SimpleNamespace(data={"id": "u1", "username": "joel"})) == [{"id": "u1", "username": "joel"}]
     assert rows(SimpleNamespace(data=[{"id": "u1"}])) == [{"id": "u1"}]
     assert rows(SimpleNamespace(data=None)) == []
+
+
+# --- Ocheso for Platforms on the existing routes --------------------------------
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/v1/orgs"),
+        ("post", "/v1/orgs"),
+        ("post", "/v1/orgs/bootstrap"),
+        ("get", "/v1/orgs/yoursite/keys"),
+        ("post", "/v1/orgs/yoursite/keys"),
+        ("post", "/v1/tournaments/x/invites"),
+        ("get", "/v1/tournaments/x/invites"),
+        ("get", "/v1/tournaments/x/autopilot"),
+        ("post", "/v1/tournaments/x/autopilot/pause"),
+        ("post", "/v1/tournaments/x/autopilot/start-now"),
+        ("get", "/v1/me/invites"),
+        ("post", "/v1/invites/by-token/0123456789abcdef0123456789abcdef/accept"),
+        ("get", "/v1/me/embed-sessions"),
+    ],
+)
+def test_platform_console_routes_need_a_token(method, path):
+    kwargs = {"json": {}} if method == "post" else {}
+    assert getattr(client, method)(path, **kwargs).status_code == 401
+
+
+def _created(monkeypatch, body):
+    from fakedb import install
+
+    row = {**GOOD, "id": "t1", "slug": "saturday-rapid", "owner_id": "u1", "tiebreaks": ["buchholz"],
+           "is_listed": True, "participants_visible": True, "games_watchable": True, "requires_code": False,
+           "auto_approve": True, "status": "draft", "created_at": "2026-10-25T00:00:00Z",
+           "updated_at": "2026-10-25T00:00:00Z", "org_id": "o1", "identity_mode": "any", "rated": False,
+           "autopilot": True, "language": "fr", "autopilot_note": None}
+    inserted = []
+
+    def tournaments(ops):
+        inserted.extend(args[0] for op, args, _ in ops if op == "insert")
+        return [row]
+
+    log = install(monkeypatch, {"organizations": [{"id": "o1", "slug": "yoursite"}], "tournaments": tournaments})
+    return client.post("/v1/tournaments", json=body, headers=AUTH), log, inserted
+
+
+def test_create_for_an_organisation_by_slug(monkeypatch):
+    r, log, inserted = _created(monkeypatch, {**GOOD, "org": "yoursite", "identity_mode": "any", "autopilot": True,
+                                              "language": "fr"})
+    assert r.status_code == 201, r.text
+    assert r.json()["org_id"] == "o1" and r.json()["identity_mode"] == "any"
+    assert [name for _, _, name, _ in log] == ["organizations", "tournaments"]
+    # By id, never the slug; and unrated unless the organiser asked (A9).
+    [data] = inserted
+    assert data["org_id"] == "o1" and "org" not in data and data["rated"] is False and data["autopilot"] is True
+
+
+def test_a_personal_tournament_keeps_the_rated_default(monkeypatch):
+    r, _, inserted = _created(monkeypatch, GOOD)
+    assert r.status_code == 201 and "rated" not in inserted[0] and "org_id" not in inserted[0]
+
+
+def test_platform_users_need_an_organisation():
+    assert client.post("/v1/tournaments", json={**GOOD, "identity_mode": "platform"}, headers=AUTH).status_code == 422
+
+
+def test_update_takes_the_autopilot_fields_but_not_the_system_ones():
+    for field, value in (("autopilot_note", "x"), ("org_id", "o2"), ("embed_rev", 3), ("series_id", "s")):
+        assert client.patch("/v1/tournaments/x", json={field: value}, headers=AUTH).status_code == 422, field
+    from schemas.tournament import TournamentUpdate
+
+    TournamentUpdate(autopilot=True, min_players=4, short_field="wait", round_break_s=0, language="both",
+                     identity_mode="platform", rated=True, invite_only=True, org_listed=False)
+
+
+def test_entries_claimed_from_email_or_made_by_a_platform_read_back():
+    from schemas.participant import ParticipantOut
+
+    for via in ("email", "platform"):
+        ParticipantOut(id="p", tournament_id="t", user_id="u", status="approved", joined_via=via,
+                       created_at="2026-10-25T00:00:00Z")
+
+
+def test_a_refusal_keeps_its_detail_and_gains_a_code():
+    http = fail(APIError({"code": "23514", "message": "this tournament is full"}))
+    assert (http.status_code, http.detail, http.code) == (409, "this tournament is full", "conflict")
