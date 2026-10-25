@@ -176,12 +176,20 @@ for i, name in enumerate(["Ama", "Bea", "Cid", "Dan"], 1):
     s = expect(f"{name}'s frame trades it for a session", api.post("/v1/embed/sessions", json={
         "player_token": tok["token"], "parent_origin": ORIGIN}), 201)
     members[s["player"]["id"]] = {"name": name, "session": s["session"], "external_id": f"user-{i}"}
-    check(f"...a member session for {name}", tokens.EMBED_SESSION.fullmatch(s["session"]) is not None
-          and s["player"]["kind"] == "member")
+    check(f"...a member session for {name}, scoped to the event its token named", tokens.EMBED_SESSION.fullmatch(s["session"]) is not None
+          and s["player"]["kind"] == "member" and s.get("scope") == {"tournament": SLUG}, json.dumps(s.get("scope")))
     expect(f"{name} joins", api.post(f"/v1/embed/t/{SLUG}/join", headers=S(s["session"]), json={}))
 by_name = {m["name"]: (pid, m["session"]) for pid, m in members.items()}
 bad = api.post("/v1/embed/sessions", json={"player_token": tok["token"], "parent_origin": "https://copycat.example"})
-check("a page not on the allowed list cannot sign players in", bad.status_code == 403, bad.text[:200])
+check("a page not on the allowed list cannot sign players in (403 origin_not_allowed)",
+      bad.status_code == 403 and bad.json().get("code") == "origin_not_allowed", bad.text[:200])
+bad = api.post("/v1/embed/sessions", json={"player_token": tok["token"], "parent_origin": ORIGIN.replace("https:", "http:")})
+check("...nor its own page over plain http", bad.status_code == 403, bad.text[:200])
+# A partner's app opens the frame top level (?app=1) and answers need-identity
+# itself: no parent page, so no parent_origin, and the list does not apply.
+app = api.post("/v1/embed/sessions", json={"player_token": tok["token"]})
+check("an app's webview, with no parent page to name, signs the player in all the same",
+      app.status_code == 201 and app.json()["player"]["kind"] == "member", app.text[:200])
 dan = by_name["Dan"][1]
 w = expect("Dan withdraws before the start", api.post(f"/v1/embed/t/{SLUG}/withdraw", headers=S(dan)))
 check("...withdrawn", w.get("status") == "withdrawn")
@@ -201,6 +209,8 @@ check("...in, and round 1 is next", (me.get("entry") or {}).get("status") == "ap
 bundle = expect("the public bundle", api.get(f"/v1/embed/t/{SLUG}"))
 check("...four entries, a topic, the branded link", bundle["tournament"]["entry"]["count"] == 4
       and bundle["realtime"]["topic"].startswith("live:t:") and bundle["hosted_url"].endswith(f"/o/{ORG}/{SLUG}"))
+check("...and the organisation's allowed origins, for the frame's own check", bundle["org"].get("allowed_origins") == [ORIGIN],
+      json.dumps(bundle["org"]))
 pol = expect("the frame policy", api.get(f"/v1/embed/policy?t={SLUG}"))
 check("...is the organisation's allowed list", pol["frame_ancestors"] == f"'self' {ORIGIN}", json.dumps(pol))
 
@@ -336,6 +346,12 @@ check("...three, all finished", [x["number"] for x in rounds] == [1, 2, 3] and a
 bundle = expect("the bundle after the finish", api.get(f"/v1/embed/t/{SLUG}"))
 check("...finished, with the same table", bundle["tournament"]["status"] == "finished"
       and {line["player"]["id"]: line["points"] for line in bundle["standings"]["lines"]} == got)
+check("...the current and previous round with their games (a Swiss; a knockout keeps every round)",
+      [(x["number"], x["status"], len(x["games"])) for x in bundle["rounds"]] == [(2, "finished", 2), (3, "finished", 2)]
+      and all(g["white"] and g["black"] and g["result"] for x in bundle["rounds"] for g in x["games"]),
+      json.dumps([(x["number"], x["status"], len(x["games"])) for x in bundle["rounds"]]))
+check("...lean: no move lists, and a player is a name and an id", "moves" not in json.dumps(bundle["rounds"])
+      and all(set(g["white"]) == {"id", "display_name", "username"} for x in bundle["rounds"] for g in x["games"]))
 grouped = expect("Studio's tournaments, grouped", owner.get(f"/v1/orgs/{ORG}/tournaments"))
 check("...it is under finished", any(x["slug"] == SLUG for x in grouped["finished"]))
 
@@ -473,8 +489,8 @@ r = femi.post("/v1/embed/handoff/bind", {"h": H})
 check("nobody else can bind it after", r.status_code == 404, r.text[:200])
 red = expect("the frame redeems S", api.post("/v1/embed/handoff/redeem", json={"s": S_HEX}))
 KS = red.get("session", "")
-check("...an account session", red["status"] == "ok" and tokens.EMBED_SESSION.fullmatch(KS) is not None
-      and red["player"]["kind"] == "account")
+check("...an account session, for the organisation's events", red["status"] == "ok" and tokens.EMBED_SESSION.fullmatch(KS) is not None
+      and red["player"]["kind"] == "account" and red.get("scope") == {"tournament": None}, json.dumps(red.get("scope")))
 check("a second redeem is refused: used",
       expect("redeem again", api.post("/v1/embed/handoff/redeem", json={"s": S_HEX}))["status"] == "used")
 check("a redeem with the hash instead of S finds nothing",
@@ -483,6 +499,7 @@ km = expect("Kofi's frame, with that session", api.get(f"/v1/embed/t/{CUP}/me", 
 check("...sees him in", (km.get("entry") or {}).get("status") == "approved")
 acct = expect("an account session minted from a sign-in token", femi.post("/v1/embed/sessions/account", {"slug": CUP}), 201)
 FS = acct["session"]
+check("...with the same scope", acct.get("scope") == {"tournament": None}, json.dumps(acct.get("scope")))
 listed = expect("Kofi's signed-in embeds", kofi.get("/v1/me/embed-sessions"))
 check("...one", len(listed) == 1)
 expect("he signs it out from his account", kofi.delete(f"/v1/me/embed-sessions/{listed[0]['id']}"), 204)
@@ -504,7 +521,9 @@ SB = tb["slug"]
 expect("published", api.post(f"/v1/platform/tournaments/{SB}/publish", headers=KB))
 loose = expect("an unscoped token for one of the first organisation's users", api.post(
     "/v1/platform/player-tokens", headers=K, json={"external_id": "user-1", "name": "Ama"}))
-LS = expect("...and its session", api.post("/v1/embed/sessions", json={"player_token": loose["token"]}), 201)["session"]
+loose_s = expect("...and its session", api.post("/v1/embed/sessions", json={"player_token": loose["token"], "parent_origin": ORIGIN}), 201)
+LS = loose_s["session"]
+check("...which reaches the whole organisation", loose_s.get("scope") == {"tournament": None}, json.dumps(loose_s.get("scope")))
 r = api.post(f"/v1/embed/t/{SB}/join", headers=S(LS), json={})
 check("a member of one organisation cannot join another's event: no such tournament", r.status_code == 404, r.text[:200])
 r = api.get(f"/v1/embed/t/{SB}/me", headers=S(LS))
@@ -524,6 +543,7 @@ check("Studio does not show another organisation, or say that it exists", r.stat
 rb = {}
 for ext, name in (("r1", "Rex"), ("r2", "Ria")):
     tk = expect(f"{name}'s token", api.post("/v1/platform/player-tokens", headers=KB, json={"external_id": ext, "name": name}))
+    # The rival lists no origins: any page may sign its players in, and need not say which.
     rb[name] = expect(f"{name}'s session", api.post("/v1/embed/sessions", json={"player_token": tk["token"]}), 201)["session"]
     expect(f"{name} joins their own organisation's arena", api.post(f"/v1/embed/t/{SB}/join", headers=S(rb[name]), json={}))
 expect("the rival starts it", api.post(f"/v1/platform/tournaments/{SB}/start", headers=KB))
@@ -561,7 +581,8 @@ check("...gone", all(o["slug"] != ORG for o in expect("Sam's organisations after
 
 eve = sql(f"select profile_id from org_players op join organizations o on o.id = op.org_id where o.slug = '{ORG}' and external_id = 'user-5'")
 eve_tok = expect("Eve's token", api.post("/v1/platform/player-tokens", headers=K, json={"external_id": "user-5", "name": "Eve"}))
-eve_s = expect("Eve's session", api.post("/v1/embed/sessions", json={"player_token": eve_tok["token"]}), 201)["session"]
+eve_s = expect("Eve's session", api.post("/v1/embed/sessions", json={"player_token": eve_tok["token"], "parent_origin": ORIGIN}),
+               201)["session"]
 blk = expect("an admin blocks Eve", owner.post(f"/v1/orgs/{ORG}/players/{eve}/block", {"blocked": True}))
 check("...by the partner's id", blk.get("external_id") == "user-5")
 r = api.get(f"/v1/embed/t/{CUP}/me", headers=S(eve_s))
@@ -595,6 +616,16 @@ upd = expect("the organiser skips the Friday after", owner.patch(f"/v1/orgs/{ORG
 check("...noted", day in upd["skip_dates"])
 upd = expect("and moves it to 20:00", owner.patch(f"/v1/orgs/{ORG}/series/{ser['id']}", {"local_time": "20:00"}))
 check("...for the next instance made", upd["local_time"].startswith("20:00"))
+for origin, path in ((ORIGIN, ""), ("https://copycat.example", None)):
+    body = {"s": ser["slug"], "o": ORG, "origin": origin, "view": "series", **({} if path is None else {"path": path})}
+    ping = api.post("/v1/embed/ping", content=json.dumps(body), headers={"Content-Type": "text/plain"})
+    check(f"the loader's beacon names the series, from {origin} (204)", ping.status_code == 204, ping.text[:200])
+ins = {(i["origin"], i["view"]): i for i in expect("Studio's install check again", owner.get(f"/v1/orgs/{ORG}/installs"))}
+check("...the series seen on the partner's page, allowed, no path kept",
+      (ins.get((ORIGIN, "series")) or {}).get("allowed") is True and ins[(ORIGIN, "series")]["last_path"] is None,
+      json.dumps(ins.get((ORIGIN, "series"))))
+check("...and on a page not on the list, recorded as not allowed",
+      (ins.get(("https://copycat.example", "series")) or {}).get("allowed") is False)
 sched = expect("the organisation's schedule embed", api.get(f"/v1/embed/o/{ORG}"))
 check("...lists the series", any(s["slug"] == ser["slug"] for s in sched["series"]), json.dumps(sched)[:300])
 

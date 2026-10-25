@@ -211,11 +211,39 @@ for bad in ["http://a.com", "https://*.com", "https://a.com/path", "*", "https:/
     check(f"allowed origins refuse {bad}", value(f"select private.origins_ok(array[{q(bad)}])") == "f")
 check("more than 50 origins are refused",
       value("select private.origins_ok(array(select 'https://h' || i || '.com' from generate_series(1, 51) i))") == "f")
-check("*.a.com allows a subdomain", value("select private.origin_allowed(array['https://*.a.com'], 'https://x.a.com')") == "t")
-check("...and a deeper one", value("select private.origin_allowed(array['https://*.a.com'], 'https://x.y.a.com')") == "t")
-check("...but not a.com itself (CSP rules)", value("select private.origin_allowed(array['https://*.a.com'], 'https://a.com')") == "f")
-check("...nor evila.com", value("select private.origin_allowed(array['https://*.a.com'], 'https://evila.com')") == "f")
-check("an empty list allows anywhere", value("select private.origin_allowed('{}', 'https://anything.example')") == "t")
+# origin_allowed is CSP's rule, as the site's frame applies it (embed/protocol.ts
+# originAllowed): the frame and the database must never disagree about a page.
+for entries, page, want, why in [
+    (["https://a.com"], "https://a.com", True, "an exact origin"),
+    (["https://a.com"], "https://A.com", True, "...in any case"),
+    (["https://a.com"], "https://a.com:443", True, "...with its default port said"),
+    (["https://a.com"], "https://a.com:8443", False, "an entry without a port is the default port only"),
+    (["https://a.com"], "http://a.com", False, "an https entry never allows http"),
+    (["http://localhost:3000"], "https://localhost:3000", True, "an http entry also allows https (CSP's upgrade)"),
+    (["http://localhost:3000"], "http://localhost:3001", False, "...on its own port"),
+    (["http://127.0.0.1"], "http://127.0.0.1:80", True, "...and its default port"),
+    (["https://a.com:8443"], "https://a.com:8443", True, "a port"),
+    (["https://a.com:8443"], "https://a.com", False, "...is that port only"),
+    (["https://a.com:*"], "https://a.com:8443", True, ":* is any port"),
+    (["https://a.com:*"], "https://a.com", True, "...the default one too"),
+    (["https://*.a.com"], "https://x.a.com", True, "*.a.com allows a subdomain"),
+    (["https://*.a.com"], "https://x.y.a.com", True, "...and a deeper one"),
+    (["https://*.a.com"], "https://a.com", False, "...but not a.com itself (CSP rules)"),
+    (["https://*.a.com"], "https://evila.com", False, "...nor evila.com"),
+    (["https://*.a.com"], "https://xa.com", False, "...nor xa.com"),
+    (["https://*.a.com"], "http://x.a.com", False, "...nor a subdomain over http"),
+    (["https://*.a.com"], "https://x.a.com:8443", False, "...nor on another port"),
+    (["https://*.a.com:*"], "https://x.a.com:8443", True, "...unless the entry says :*"),
+    (["https://a.com"], "https://a.com.evil.example", False, "a host that only starts the same"),
+    (["https://a.com/"], "https://a.com", True, "an entry's trailing slash"),
+    (["https://a.com", "https://b.com"], "https://b.com", True, "any entry of several"),
+    (["*"], "https://anything.example", True, "* is anywhere"),
+    (["*"], "null", False, "...but never an opaque origin"),
+    (["https://a.com"], "javascript:alert(1)", False, "garbage is no origin"),
+    ([], "https://anything.example", True, "an empty list allows anywhere"),
+]:
+    got = value(f"select private.origin_allowed(array[{', '.join(q(e) for e in entries)}]::text[], {q(page)})")
+    check(f"origin_allowed: {why} ({entries} / {page})", got == ("t" if want else "f"), got)
 
 for url, ok in [("https://hooks.example.com/ocheso", True), ("https://hooks.example.com:443/x?y=1", True),
                 ("http://hooks.example.com/x", False), ("https://hooks.example.com:8443/x", False),
@@ -529,18 +557,34 @@ denied("nor added by username (members have none)", f"select add_participant('{S
 # =============================================================================
 # Embed sessions and the dispatchers
 # =============================================================================
+# Acme lists its origins (https://acme.example, https://*.acme.example). A
+# frame signing one of its players in says which page it is in: PAGE.
+PAGE = "https://shop.acme.example"
 sess = emb_ok("the frame trades the player token for a session", "emb-session-member",
-              {"token": sha(PTOK), "parent_origin": "https://shop.acme.example"})
+              {"token": sha(PTOK), "parent_origin": PAGE})
 SESS = sess.get("session", "")
 check("oche_ and 64 hex, for the member", SESS.startswith("oche_") and len(SESS) == 69
       and sess.get("player", {}).get("kind") == "member")
+check("...scoped to the event its token was made for", sess.get("scope") == {"tournament": PT_SLUG}, json.dumps(sess.get("scope")))
 check("only the session's hash is kept", value(f"select kind from private.embed_sessions where hash = '{sha(SESS)}'") == "member")
 check("the token is reusable while it lasts (one fetch serves every widget)",
-      emb("emb-session-member", {"token": sha(PTOK)})[0])
-check("a page not on the allowed list cannot sign players in",
-      "28000" in emb("emb-session-member", {"token": sha(PTOK), "parent_origin": "https://evil.example"})[1])
+      emb("emb-session-member", {"token": sha(PTOK), "parent_origin": "https://acme.example"})[0])
+check("a page not on the allowed list cannot sign players in (OC403)",
+      "OC403" in emb("emb-session-member", {"token": sha(PTOK), "parent_origin": "https://evil.example"})[1])
+check("...nor acme.example's lookalike", "OC403" in emb("emb-session-member", {"token": sha(PTOK), "parent_origin": "https://evilacme.example"})[1])
+check("...nor its pages over plain http", "OC403" in emb("emb-session-member", {"token": sha(PTOK), "parent_origin": "http://shop.acme.example"})[1])
+# An app's webview (?app=1) is top level: there is no parent page to name.
+# Given, a page is checked (D3); not given, it is let through - the list is a
+# guard for honest frames, not a lock on the token.
+APP = emb_ok("a frame with no parent page (an app's webview) says none, and is let through", "emb-session-member",
+             {"token": sha(PTOK)})
+check("...a member session, with no page kept", APP.get("player", {}).get("kind") == "member"
+      and value(f"select coalesce(parent_origin, 'none') from private.embed_sessions where hash = '{sha(APP.get('session', ''))}'") == "none")
+check("...and an empty page counts as none", emb("emb-session-member", {"token": sha(PTOK), "parent_origin": ""})[0])
+check("the origin a session was made on is kept with it",
+      value(f"select parent_origin from private.embed_sessions where hash = '{sha(SESS)}'") == PAGE)
 value(f"update private.player_tokens set expires_at = now() - interval '1 second' where hash = '{sha(PTOK)}'")
-check("an expired player token is a 401", "OC401" in emb("emb-session-member", {"token": sha(PTOK)})[1])
+check("an expired player token is a 401", "OC401" in emb("emb-session-member", {"token": sha(PTOK), "parent_origin": PAGE})[1])
 check("a player token is not a session", "OC401" in emb("emb-me", {"session": sha(PTOK), "slug": PT_SLUG})[1])
 
 me = emb_ok("emb-me: the player's own view of the event", "emb-me", {"session": sha(SESS), "slug": PT_SLUG})
@@ -552,8 +596,10 @@ ACC_ONLY = tournament(OWNER, "Accounts Only", org=ORG, status="registration")
 check("a session made from an event's token stays in that event",
       "P0002" in emb("emb-join", {"session": sha(SESS), "slug": slug(ACC_ONLY)})[1])
 WIDE = emb_ok("an organisation-wide session", "emb-session-member",
-              {"token": sha(org_ok("an unscoped token", "org-player", {"key": KEY, "external_id": "u-100", "name": "Kemi A."})["token"])})
+              {"token": sha(org_ok("an unscoped token", "org-player", {"key": KEY, "external_id": "u-100", "name": "Kemi A."})["token"]),
+               "parent_origin": PAGE})
 WIDE_S = sha(WIDE.get("session", ""))
+check("...says so: no tournament in its scope", WIDE.get("scope") == {"tournament": None}, json.dumps(WIDE.get("scope")))
 check("members are refused where only accounts play",
       "28000" in emb("emb-join", {"session": WIDE_S, "slug": slug(ACC_ONLY)})[1])
 
@@ -573,7 +619,7 @@ denied("players cannot call the session helpers directly", f"select private.sess
 # A token for one tournament makes a session for that tournament only.
 T2 = tournament(OWNER, "Second Platform Event", org=ORG, status="registration", identity_mode="platform")
 scoped = org_ok("a token scoped to one event", "org-player", {"key": KEY, "external_id": "u-300", "name": "Dayo", "tournament": PT_SLUG})
-s_scoped = emb_ok("...makes a session", "emb-session-member", {"token": sha(scoped["token"])})["session"]
+s_scoped = emb_ok("...makes a session", "emb-session-member", {"token": sha(scoped["token"]), "parent_origin": PAGE})["session"]
 check("...that cannot touch another event of the same organisation",
       "P0002" in emb("emb-join", {"session": sha(s_scoped), "slug": slug(T2)})[1])
 joined = emb_ok("...and joins its own", "emb-join", {"session": sha(s_scoped), "slug": PT_SLUG})
@@ -600,8 +646,8 @@ check("...the fields it may change, and no others", upd.get("title") == "Platfor
 listing = org_ok("a platform lists its events", "org-read", {"key": sha(READ_ONLY), "what": "tournaments"})
 check("...its own only", PT_SLUG in [t["slug"] for t in listing.get("tournaments", [])]
       and all(t.get("title") != "Rival Open" for t in listing.get("tournaments", [])))
-KS = emb_ok("Kemi's session", "emb-session-member", {"token": sha(org_ok("t", "org-player", {"key": KEY, "external_id": "u-100", "name": "Kemi A."})["token"])})["session"]
-BS = emb_ok("Bola's session", "emb-session-member", {"token": sha(org_ok("t", "org-player", {"key": KEY, "external_id": "u-200", "name": "Bola"})["token"])})["session"]
+KS = emb_ok("Kemi's session", "emb-session-member", {"token": sha(org_ok("t", "org-player", {"key": KEY, "external_id": "u-100", "name": "Kemi A."})["token"]), "parent_origin": PAGE})["session"]
+BS = emb_ok("Bola's session", "emb-session-member", {"token": sha(org_ok("t", "org-player", {"key": KEY, "external_id": "u-200", "name": "Bola"})["token"]), "parent_origin": PAGE})["session"]
 value(f"update tournaments set status = 'live' where id = '{PT}'")
 check("withdrawing once it has started is refused, with the reason",
       "has started" in emb("emb-withdraw", {"session": sha(BS), "slug": PT_SLUG})[1])
@@ -616,7 +662,8 @@ check("Black cannot move for White", "not your move" in emb("emb-move", move)[1]
 RIVAL_KEY = sha(json.loads(value(f"select create_org_key('{OTHER_ORG}', 'Rival key')", OUTSIDER))["key"])
 rival_tok = org_ok("a rival platform signs its own player in", "org-player",
                    {"key": RIVAL_KEY, "external_id": "r-1", "name": "Rival"})["token"]
-RIVAL_S = emb_ok("...who gets a session", "emb-session-member", {"token": sha(rival_tok)})["session"]
+RIVAL_S = emb_ok("...who gets a session, on any page: its organisation lists no origins", "emb-session-member",
+                 {"token": sha(rival_tok)})["session"]
 check("a session from another organisation cannot touch the game",
       "P0002" in emb("emb-move", {**move, "session": sha(RIVAL_S)})[1])
 played = emb_ok("White plays e4 through the embed", "emb-move", {**move, "session": sha(KS)})
@@ -639,7 +686,7 @@ check("...the API is handed the queue and ratings to pick from", q1.get("status"
 check("...and the game and variant to set the board up with",
       (q1.get("tournament") or {}).get("id") == ARENA and q1["tournament"].get("game") == "chess"
       and q1["tournament"].get("variant") == "standard")
-DS = emb_ok("Dayo's session", "emb-session-member", {"token": sha(org_ok("t", "org-player", {"key": KEY, "external_id": "u-300", "name": "Dayo"})["token"])})["session"]
+DS = emb_ok("Dayo's session", "emb-session-member", {"token": sha(org_ok("t", "org-player", {"key": KEY, "external_id": "u-300", "name": "Dayo"})["token"]), "parent_origin": PAGE})["session"]
 pair = {"tournament": ARENA, "games": [{"white": KEMI, "black": BOLA, "position": START, "turn": "white"}]}
 check("a third player cannot pair two others", "one of its two players" in emb("emb-arena-pairings", {**pair, "session": sha(DS)})[1])
 made_g = emb_ok("Bola pairs with Kemi", "emb-arena-pairings", {**pair, "session": sha(BS)})
@@ -658,6 +705,7 @@ acc = json.loads(allowed("a signed-in account trades its token for an embed sess
 ACC_S = sha(acc.get("session", ""))
 check("...an account session, 7 days", acc.get("player", {}).get("kind") == "account"
       and value(f"select (expires_at > now() + interval '6 days')::text from private.embed_sessions where hash = '{ACC_S}'") == "true")
+check("...whose scope is the organisation (no tournament)", acc.get("scope") == {"tournament": None}, json.dumps(acc.get("scope")))
 check("...scoped to the organisation, so it works on its other events",
       emb("emb-me", {"session": ACC_S, "slug": slug(ACC_ONLY)})[0])
 check("...but an account is refused where only platform users play",
@@ -688,6 +736,7 @@ check("knowing h (it is in the popup's URL) redeems nothing",
 red = emb_ok("the frame redeems S", "emb-handoff-redeem", {"s": S_RAW})
 check("...and gets the account's session", red.get("status") == "ok" and red.get("session", "").startswith("oche_")
       and red.get("player", {}).get("id") == FAN)
+check("...with its scope, like every other way in", red.get("scope") == {"tournament": None}, json.dumps(red.get("scope")))
 check("a second redeem is refused", emb_ok("redeeming again", "emb-handoff-redeem", {"s": S_RAW}).get("status") == "used")
 
 # =============================================================================
@@ -1347,6 +1396,20 @@ for bad_path in ("//evil.example/steal", "/go?to=https://evil.example", "/a/../b
 check("...a path that is not a plain path is never stored",
       value(f"select coalesce(last_path, '-') from org_installs where org_id = '{ORG}' "
             "and origin = 'https://blog.acme.example' and view = 'standings'") == "-")
+series_ping = emb_ok("the loader's beacon names a series and its organisation, with an empty path", "emb-ping",
+                     {"s": "friday-blitz", "o": "acme", "origin": "https://news.acme.example", "view": "series", "path": ""})
+check("...recorded for the organisation, allowed by the list, no path kept", series_ping.get("first_seen") is True
+      and value(f"select allowed || ' ' || coalesce(last_path, '-') from org_installs "
+                f"where org_id = '{ORG}' and origin = 'https://news.acme.example'") == "true -")
+emb_ok("a series beacon from a page not on the list", "emb-ping",
+       {"s": "friday-blitz", "o": "acme", "origin": "https://copycat.example", "view": "series"})
+check("...is recorded as not allowed, like any other sighting",
+      value(f"select allowed from org_installs where org_id = '{ORG}' and origin = 'https://copycat.example' "
+            "and view = 'series'") == "f")
+check("a series that is not the organisation's is ignored",
+      emb_ok("a beacon naming the rival's series under acme", "emb-ping",
+             {"s": "rival-weekly", "o": "acme", "origin": "https://news2.acme.example", "view": "series"}).get("status") == "ignored"
+      and value("select count(*) from org_installs where origin = 'https://news2.acme.example'") == "0")
 
 
 def invite_link_install(org_t: str, email: str):
@@ -1366,6 +1429,18 @@ value(f"update org_installs set last_path = '/signin', allowed = true, last_seen
       f"where org_id = '{ORG}' and origin = 'https://copycat.example'")
 check("the invitation links the latest page on a listed origin with a plain path - never a spoofed one",
       invite_link_install(LINK_T, "linkee@platforms.test") == {"origin": "https://blog.acme.example", "path": "/club/blitz"})
+# The partner tests with the sandbox: http://localhost:3000 on the list, which
+# the frame lets stand for https://localhost:3000 too. Anyone can then ping as
+# https://localhost:3000, and keep it the freshest sighting.
+LISTED = value(f"select allowed_origins::text from organizations where id = '{ORG}'")
+value(f"update organizations set allowed_origins = allowed_origins || '{{http://localhost:3000,https://127.0.0.1:3001}}' "
+      f"where id = '{ORG}'")
+for local in ("https://localhost:3000", "https://127.0.0.1:3001"):
+    emb_ok(f"a ping as {local}", "emb-ping", {"o": "acme", "origin": local, "view": "join", "path": "/x"})
+    value(f"update org_installs set last_seen_at = now() + interval '2 minutes' where org_id = '{ORG}' and origin = '{local}'")
+check("...an invitation never goes to the invitee's own machine, through an http entry or an https one",
+      invite_link_install(LINK_T, "linkee@platforms.test") == {"origin": "https://blog.acme.example", "path": "/club/blitz"})
+value(f"update organizations set allowed_origins = '{LISTED}' where id = '{ORG}'")
 NOLIST = value("select id from create_organization('nolist', 'No List Yet')", OWNER)  # no website: an empty list
 NOLIST_T = tournament(OWNER, "No List Cup", org=NOLIST, status="registration")
 value(f"select add_invites('{NOLIST_T}', {js([{'email': 'nolist-invitee@platforms.test'}])})", OWNER)
@@ -1397,13 +1472,17 @@ check("visitors cannot open a game that is not watchable", "P0002" in emb("emb-g
 check("the frame policy comes from the organisation",
       json.loads(value(f"select get_embed_policy('{slug(ANY_T)}')", ANON)) == ["https://acme.example", "https://*.acme.example"])
 check("...anywhere for a personal event", value(f"select get_embed_policy('{slug(PERS)}')", ANON) == "[]")
+check("the bundle's organisation carries its allowed origins (public, as the policy is)",
+      bundle["org"].get("allowed_origins") == ["https://acme.example", "https://*.acme.example"])
+pers_s = json.loads(allowed("an account session for a personal event", f"select create_account_embed_session('{slug(PERS)}')", FAN))
+check("...is scoped to that event", pers_s.get("scope") == {"tournament": slug(PERS)}, json.dumps(pers_s.get("scope")))
 check("...and nothing for no such thing", value("select get_embed_policy('no-such-slug') is null", ANON) == "t")
 
 # =============================================================================
 # Erasure, autopilot controls, the rules once
 # =============================================================================
 BLK = org_ok("a player to block", "org-player", {"key": KEY, "external_id": "u-400", "name": "Rowdy", "tournament": slug(ANY_T), "enter": True})
-blk_s = emb_ok("...with a session", "emb-session-member", {"token": sha(BLK["token"])})["session"]
+blk_s = emb_ok("...with a session", "emb-session-member", {"token": sha(BLK["token"]), "parent_origin": PAGE})["session"]
 denied("staff cannot block players", f"select block_org_player('{ORG}', '{BLK['player']['id']}')", STAFF)
 denied("accounts are not the organisation's to block", f"select block_org_player('{ORG}', '{FAN}')", ADMIN, "remove an account")
 allowed("an admin blocks a platform player", f"select block_org_player('{ORG}', '{BLK['player']['id']}') ->> 'external_id'", ADMIN, "u-400")

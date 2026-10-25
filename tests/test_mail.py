@@ -80,7 +80,7 @@ def test_organiser_text_is_escaped():
 @pytest.mark.parametrize("extra,url", [
     ({}, f"https://www.ocheso.com/o/yoursite/weekly-blitz?invite={TOKEN}"),
     ({"partner_url": "https://yoursite.com/club?tab=events"},
-     f"https://yoursite.com/club?tab=events&ocheso_invite={TOKEN}"),
+     f"https://yoursite.com/club?tab=events&ocheso_invite={TOKEN}&ocheso_t=weekly-blitz"),
     ({"partner_url": "javascript:alert(1)"}, f"https://www.ocheso.com/o/yoursite/weekly-blitz?invite={TOKEN}"),
     ({"org": None}, f"https://www.ocheso.com/invite/weekly-blitz?e={TOKEN}"),
 ])
@@ -273,7 +273,7 @@ def test_a_batch_becomes_messages():
     assert [m["template"] for m in msgs] == ["invite", "org_invite", "postponed", "webhook_disabled"]
     invite = mail.render(msgs[0])
     # The partner page where the embed was seen, in the event's language and the organiser's timezone.
-    assert f"https://yoursite.com/club/blitz?ocheso_invite={TOKEN}" in invite["text"]
+    assert f"https://yoursite.com/club/blitz?ocheso_invite={TOKEN}&ocheso_t=weekly-blitz" in invite["text"]
     assert invite["subject"] == "Invitation : Weekly Blitz, ven. 30 oct., 19:00"
     assert invite["reply_to"] == "team@yoursite.com"
     staff = mail.render(msgs[1])

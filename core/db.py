@@ -170,12 +170,14 @@ _STATUS = {
     # many player tokens, sessions, handoffs, pings or embed actions in its
     # window. OC401 is a player token or embed session that is unknown,
     # expired or revoked - 401, so the frame asks the page for a new identity
-    # instead of showing "forbidden".
+    # instead of showing "forbidden". OC403 is a player token presented from a
+    # page that is not on the organisation's allowed origins.
     "OC429": 429,
     "OC401": 401,
+    "OC403": 403,
 }
 
-_CODE = {"OC429": "rate_limited", "OC401": "session_expired"}
+_CODE = {"OC429": "rate_limited", "OC401": "session_expired", "OC403": "origin_not_allowed"}
 
 
 def fail(error: APIError) -> HTTPException:
@@ -184,7 +186,7 @@ def fail(error: APIError) -> HTTPException:
     status = _STATUS.get(code, 400)
     # Our own functions raise sentences written for people; pass those through.
     # For everything else, keep Postgres internals out of the response.
-    own = code in ("P0002", "23514", "28000", "40001", "22023", "OC429", "OC401")
+    own = code in ("P0002", "23514", "28000", "40001", "22023", "OC429", "OC401", "OC403")
     message = (error.message if own and error.message else None) or {
         401: "Your session has expired. Sign in again.",
         403: "You don't have permission to do that.",

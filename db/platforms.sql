@@ -433,17 +433,35 @@ revoke all on private.ops_log, private.platform_settings, private.webhook_secret
 -- =============================================================================
 
 -- Whether a page at `p_origin` may host this organisation's embeds with a
--- signed-in player: the same rules as CSP frame-ancestors, so `*.a.com`
--- matches `https://x.a.com` and not `https://a.com`. An empty list allows any.
+-- signed-in player. An empty list allows any. Otherwise CSP frame-ancestors'
+-- rules, exactly as the site's frame applies them (embed/protocol.ts
+-- originAllowed), so the frame and the database never disagree about a page:
+-- `https://a.com` is that scheme and host on the default port only;
+-- `https://*.a.com` is any subdomain of a.com, never a.com itself or
+-- evila.com; `:*` is any port; an `http://` entry also allows the https
+-- version of the same host, never the other way round; `*` is anywhere. An
+-- origin that is not scheme://host[:port] is never allowed by a list.
 create or replace function private.origin_allowed(p_origins text[], p_origin text)
 returns boolean language sql immutable as $$
   select coalesce(cardinality(p_origins), 0) = 0
-      or exists (select 1 from unnest(p_origins) a
-                  where lower(a) = lower(p_origin)
-                     or (a like 'https://*.%'
-                         and lower(p_origin) ~ '^https://[a-z0-9-]+(\.[a-z0-9-]+)*$'
-                         and char_length(p_origin) > char_length(a) - 1
-                         and right(lower(p_origin), char_length(a) - 9) = lower(substr(a, 10))));
+      or exists (
+        select 1
+          from regexp_match(lower(btrim(coalesce(p_origin, ''))),
+                            '^(https?)://([a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:.]+\])(?::([0-9]{1,5}))?$') as page(o),
+               unnest(p_origins) as list(a),
+               regexp_match(lower(btrim(a)),
+                            '^(https?)://(\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:.]+\])(?::([0-9]{1,5}|\*))?/?$') as entry(e)
+         where o is not null
+           and (btrim(a) = '*'
+                or (e is not null
+                    and (e[1] = o[1] or (e[1] = 'http' and o[1] = 'https'))
+                    -- The page's port, its scheme's default when unsaid; an
+                    -- entry without a port means that default.
+                    and case when e[4] = '*' then true
+                             when e[4] is null then o[3] is null or o[3]::int = case o[1] when 'https' then 443 else 80 end
+                             else e[4]::int = coalesce(o[3]::int, case o[1] when 'https' then 443 else 80 end) end
+                    and case when e[2] is null then o[2] = e[3]
+                             else char_length(o[2]) > char_length(e[3]) + 1 and right(o[2], char_length(e[3]) + 1) = '.' || e[3] end)));
 $$;
 
 -- Whether an origin is on the organisation's OWN list: what it declared, as
@@ -1852,6 +1870,9 @@ $$;
 -- =============================================================================
 
 -- A new session. The raw `oche_` value is in this reply and nowhere else.
+-- `scope` says how far it reaches, so a frame knows where to keep it: one
+-- tournament (a player token made for that event, or a personal event's
+-- account session) or, with tournament null, the organisation's events.
 create or replace function private.mint_session(p_kind text, p_org uuid, p_profile uuid, p_tournament uuid, p_origin text)
 returns jsonb language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -1865,7 +1886,8 @@ begin
   returning * into s;
   select * into p from profiles where id = p_profile;
   return jsonb_build_object('session', raw, 'session_id', s.id, 'expires_at', s.expires_at,
-                            'player', jsonb_build_object('id', p.id, 'name', p.display_name, 'kind', s.kind));
+                            'player', jsonb_build_object('id', p.id, 'name', p.display_name, 'kind', s.kind),
+                            'scope', jsonb_build_object('tournament', (select slug from tournaments where id = p_tournament)));
 end $$;
 revoke all on function private.mint_session(text, uuid, uuid, uuid, text) from public, anon, authenticated;
 
@@ -2046,6 +2068,14 @@ end $$;
 revoke all on function private.embed_throttle(text, jsonb) from public, anon, authenticated;
 
 -- emb-session-member {token: sha256 of the ochp_ token, parent_origin?, ip?}
+-- When the organisation lists its origins and the frame names the page it is
+-- in (the origin the browser stamped on the parent's message), that page must
+-- be on the list (D3: "only if given"). A frame with no parent page says
+-- none - an app's webview (?app=1) is top level - and is let through. This
+-- keeps an honest frame on a page the organiser never listed from signing
+-- players in; it is not a lock on the token: parent_origin is whatever the
+-- caller sends, so a leaked ochp_ token works from anywhere until it
+-- expires. OC403: the API answers 403 origin_not_allowed.
 create or replace function private.emb_session_member(body jsonb)
 returns jsonb language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -2065,7 +2095,7 @@ begin
     raise exception 'you cannot enter this organiser''s events' using errcode = '28000';
   end if;
   if origin is not null and not private.origin_allowed(o.allowed_origins, origin) then
-    raise exception '% cannot sign players in to % tournaments', origin, o.name using errcode = '28000';
+    raise exception '% cannot sign players in to % tournaments', origin, o.name using errcode = 'OC403';
   end if;
   return private.mint_session('member', pt.org_id, pt.profile_id, pt.tournament_id, origin);
 end $$;
@@ -2152,8 +2182,11 @@ begin
                                  case when h.org_id is null then h.tournament_id end, null);
 end $$;
 
--- emb-ping {t | o, origin, view, path?, ip?}: the frame saying where it is
--- (C10, E8). One write per row per five minutes, and the first sighting of an
+-- emb-ping {t | o | s and o, origin, view, path?, ip?}: the frame - or the
+-- loader's beacon, which names a series (s, with its organisation o) when
+-- the page embeds one - saying where it is (C10, E8). A series that is not
+-- the organisation's is ignored, like an unknown tournament or organisation.
+-- One write per row per five minutes, and the first sighting of an
 -- origin is an event. Anyone can send one, naming any origin, so the 200-origin
 -- cap is kept twice: origins on the organisation's own list, and the rest. A
 -- flood of made-up origins fills only the second, and the partner's real site
@@ -2172,6 +2205,10 @@ declare
 begin
   if body ? 'o' then
     o := private.org_by_slug(body ->> 'o');
+    if body ? 's' and o.id is not null
+       and not exists (select 1 from tournament_series where org_id = o.id and slug = lower(body ->> 's')) then
+      return jsonb_build_object('status', 'ignored');
+    end if;
   else
     select org.* into o from tournaments t join organizations org on org.id = t.org_id
      where t.slug = body ->> 't' and org.status = 'active';
@@ -3205,9 +3242,14 @@ begin
            -- recorded a sighting is unauthenticated and could name anyone's
            -- site, and an invitation from Ocheso's own sender must never
            -- send someone to a page that asks for their sign-in code.
+           -- Listed by an https entry, too: the frame lets an http:// entry
+           -- (allowed only for localhost testing) stand for its https twin,
+           -- but nobody's invitation goes to their own machine.
            'install', (select jsonb_build_object('origin', ins.origin, 'path', ins.last_path) from org_installs ins
                         where ins.org_id = o.id and ins.origin ~ '^https://'
-                          and private.origin_listed(o.allowed_origins, ins.origin)
+                          and ins.origin !~ '^https://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?$'
+                          and private.origin_listed(array(select a from unnest(o.allowed_origins) a where a ~ '^https://'),
+                                                    ins.origin)
                           and private.plain_path(ins.last_path) is not null
                           and ins.last_seen_at > now() - interval '30 days'
                         order by ins.last_seen_at desc limit 1),

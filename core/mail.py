@@ -165,11 +165,13 @@ def invite_url(data: dict) -> str:
     """Where "I'm in" goes (spec F4): the partner's own page when the embed
     was seen installed there - on an origin the organiser listed, see
     partner_page - else the branded hosted page, else - for a personal
-    tournament - the console's invite page."""
+    tournament - the console's invite page. On the partner's page the link
+    names the event too (ocheso_t), so the loader hands the invitation to that
+    event's widget: the page seen last may carry others."""
     token, slug = data["token"], data["slug"]
     partner = data.get("partner_url")
     if partner and re.fullmatch(r"https://[^\s\"'<>()]+", partner):
-        return _with_param(partner, "ocheso_invite", token)
+        return _with_param(_with_param(partner, "ocheso_invite", token), "ocheso_t", slug)
     org = (data.get("org") or {}).get("slug")
     if org:
         return f"{settings.SITE_URL}/o/{quote(org)}/{quote(slug)}?invite={token}"

@@ -33,7 +33,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from postgrest import APIError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from config import settings
 from db import Refusal, UserDb, anon_db, embed_call, jwt_db, one, rows
@@ -64,7 +64,20 @@ BUNDLE_FIELDS = ("id", "slug", "title", "description", "game", "variant", "forma
                  "started_at", "clock", "rounds_count", "arena_minutes", "tiebreaks", "language", "identity_mode",
                  "invite_only", "requires_code", "entry", "games_watchable", "participants_visible", "series_id",
                  "autopilot")
-ORG_FIELDS = ("slug", "name", "website", "brand", "badge")
+# allowed_origins is public already (get_org_public, the frame policy): with
+# it in the bundle the frame checks its parent against the list without a
+# second read, by the same rules the database signs players in by.
+ORG_FIELDS = ("slug", "name", "website", "brand", "badge", "allowed_origins")
+# The bundle is read whole by every viewer on every change, and a function may
+# answer at most 4.5 MB, so its rounds are bounded by games, not just rounds:
+# a 4096-player Swiss after 13 rounds holds 26,624 games. A knockout keeps
+# every round (its bracket needs them), a Swiss or round robin the current and
+# previous (D3; older rounds are on /rounds), newest first up to BUNDLE_GAMES
+# games - the newest round always whole - which keeps a knockout of 2048
+# complete. Games carry names and results, never moves; the live list, the
+# top BUNDLE_LIVE boards.
+BUNDLE_GAMES = 2500
+BUNDLE_LIVE = 100
 
 
 # -----------------------------------------------------------------------------
@@ -113,8 +126,10 @@ class _Strict(BaseModel):
 
 class MemberSessionIn(_Strict):
     player_token: str = Field(max_length=64)
-    # The page the frame is in, as the browser told the frame. When the
-    # organisation lists allowed origins it must be one of them.
+    # The page the frame is in, as the browser told the frame. When given and
+    # the organisation lists allowed origins it must be one of them (the
+    # database checks: 403 origin_not_allowed). An app's webview has no parent
+    # page and sends none.
     parent_origin: Optional[str] = Field(None, max_length=200, pattern=r"^https?://[^/\s]+$")
 
 
@@ -141,14 +156,23 @@ View = Literal["tournament", "join", "standings", "pairings", "bracket", "live",
 class PingIn(_Strict):
     t: Optional[str] = Field(None, min_length=1, max_length=120)
     o: Optional[str] = Field(None, min_length=1, max_length=40)
+    # A series, with its organisation in o: what the loader's beacon names
+    # for a page that embeds "always the current one".
+    s: Optional[str] = Field(None, min_length=1, max_length=60)
     origin: str = Field(max_length=200, pattern=r"^https?://[^/\s]+$")
     view: View = "tournament"
     path: Optional[str] = Field(None, max_length=300, pattern=r"^/[^\s]*$")
 
+    @field_validator("path", mode="before")
+    @classmethod
+    def _no_path(cls, v):
+        # A beacon that could not read the page's path may send it empty.
+        return None if isinstance(v, str) and not v.strip() else v
+
     @model_validator(mode="after")
     def _one(self) -> "PingIn":
-        if (self.t is None) == (self.o is None):
-            raise ValueError("Say t (a tournament) or o (an organisation).")
+        if (self.t is None) == (self.o is None) or (self.t is not None and self.s is not None):
+            raise ValueError("Say t (a tournament), o (an organisation), or s and o (a series).")
         return self
 
 
@@ -176,6 +200,23 @@ def person(p: dict) -> dict:
             "avatar_url": p.get("avatar_url"), "country": p.get("country"), "kind": p.get("kind")}
 
 
+def name_of(p: Optional[dict]) -> Optional[dict]:
+    """A player as a bundle's round games show one: a name to print and an id
+    to find "you" by. The avatar and country are in the table, once."""
+    return {"id": p["id"], "display_name": p.get("display_name"), "username": p.get("username")} if p else None
+
+
+def bundle_rounds(fmt: Optional[str], numbered: list[dict]) -> list[dict]:
+    """Which numbered rounds go in a bundle (see BUNDLE_GAMES), oldest first."""
+    keep, games = [], 0
+    for r in reversed(numbered if fmt == "knockout" else numbered[-2:]):
+        if keep and games + len(r["games"]) > BUNDLE_GAMES:
+            break
+        keep.append(r)
+        games += len(r["games"])
+    return keep[::-1]
+
+
 def bundle_out(raw: dict) -> dict:
     """emb-bundle's read, shaped as the spec's bundle (D3): the table and the
     rounds are computed here with the same code as /standings and /rounds."""
@@ -187,8 +228,8 @@ def bundle_out(raw: dict) -> dict:
         names.setdefault(r["user_id"], person({**r, "id": r["user_id"]}))
     history = service.results_from_rows(results)
     _, lines = service.standings_table(src, service.seeds_from_roster(roster), history)
-    every = service.rounds_out(results, raw.get("rounds") or [], names)
-    numbered = [r for r in every if r["number"] is not None]
+    every = service.rounds_out(results, raw.get("rounds") or [], {k: name_of(p) for k, p in names.items()})
+    numbered = bundle_rounds(src.get("format"), [r for r in every if r["number"] is not None])
     arena = [{**r, "games": r["games"][-100:]} for r in every if r["number"] is None]
     t = {k: src.get(k) for k in BUNDLE_FIELDS}
     if not t["clock"]:
@@ -200,13 +241,13 @@ def bundle_out(raw: dict) -> dict:
     t["note"] = src.get("autopilot_note")
     org = raw.get("org")
     live = [{**g, "white": names.get(g.get("white_id")), "black": names.get(g.get("black_id")),
-             "topic": topic(g.get("topic"), "g")} for g in raw.get("live") or []]
+             "topic": topic(g.get("topic"), "g")} for g in (raw.get("live") or [])[:BUNDLE_LIVE]]
     return {
         "v": 1,
         "tournament": t,
         "org": {k: org.get(k) for k in ORG_FIELDS} if org else None,
         "standings": service.standings_out(src, history, lines, names),
-        "rounds": numbered[-2:] + arena,
+        "rounds": numbered + arena,
         "live": live,
         "realtime": realtime(raw.get("topic"), "t"),
         "hosted_url": hosted_url((org or {}).get("slug"), src["slug"]),
@@ -480,9 +521,9 @@ async def ping(request: Request):
     try:
         body = PingIn.model_validate(json.loads(raw or b"{}"))
     except (ValueError, ValidationError):
-        raise Refusal(400, "Send JSON: {t | o, origin, view, path}.", code="bad_request") from None
-    # Only the key that applies: the database tells t from o by which is present.
-    which = {"t": body.t} if body.t is not None else {"o": body.o}
+        raise Refusal(400, "Send JSON: {t | o | s and o, origin, view, path?}.", code="bad_request") from None
+    # Only the keys that apply: the database tells t from o by which is present.
+    which = {"t": body.t} if body.t is not None else {"o": body.o, **({"s": body.s} if body.s is not None else {})}
     await run_in_threadpool(embed_call, "emb-ping", {
         **which, "origin": body.origin.lower(), "view": body.view, "path": body.path, "ip": client_ip(request),
     })

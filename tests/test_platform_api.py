@@ -323,10 +323,13 @@ def test_a_session_travels_as_its_hash(monkeypatch):
 def test_a_player_token_becomes_a_session_by_its_hash(monkeypatch):
     log = install(monkeypatch, {"embed_call": lambda p: {"counted": True} if json.loads(p["p_payload"]).get("phase")
                                 else {"session": SESSION, "expires_at": "x",
-                                      "player": {"id": "p", "name": "Ama", "kind": "member"}}})
+                                      "player": {"id": "p", "name": "Ama", "kind": "member"},
+                                      "scope": {"tournament": "weekly"}}})
     r = client.post("/v1/embed/sessions", json={"player_token": PLAYER, "parent_origin": "https://yoursite.com"},
                     headers={"X-Forwarded-For": "203.0.113.7, 10.0.0.1"})
     assert r.status_code == 201 and r.json()["session"] == SESSION
+    # The database's scope, as it said it: where the frame keeps the session.
+    assert r.json()["scope"] == {"tournament": "weekly"}
     # Counted first in a call of its own, so failed attempts still count.
     hit, real = payloads(log)
     assert hit["phase"] == "hit" and real["counted"] is True and "phase" not in real
@@ -334,6 +337,40 @@ def test_a_player_token_becomes_a_session_by_its_hash(monkeypatch):
     assert real["parent_origin"] == "https://yoursite.com"
     assert len(real["ip"]) == 64 and "203.0.113.7" not in json.dumps(real)
     assert not leaked(log, PLAYER)
+
+
+def test_a_page_off_the_list_is_403_origin_not_allowed(monkeypatch):
+    def embed_call(params):
+        if json.loads(params["p_payload"]).get("phase"):
+            return {"counted": True}
+        raise APIError({"code": "OC403", "message": "https://copycat.example cannot sign players in to Yoursite tournaments"})
+
+    log = install(monkeypatch, {"embed_call": embed_call})
+    r = client.post("/v1/embed/sessions", json={"player_token": PLAYER, "parent_origin": "https://copycat.example"})
+    assert r.status_code == 403
+    assert r.json() == {"detail": "https://copycat.example cannot sign players in to Yoursite tournaments",
+                        "code": "origin_not_allowed"}
+    # Counted before it was refused, so a token cannot be tried on page after page for free.
+    assert [b.get("phase") for b in payloads(log)] == ["hit", None]
+
+
+def test_an_app_webview_sends_no_parent_origin_and_gets_a_session(monkeypatch):
+    # ?app=1 is top level: no parent page to name. The API passes null on and
+    # the database checks a page only when one is given (D3).
+    log = install(monkeypatch, {"embed_call": lambda p: {"counted": True} if json.loads(p["p_payload"]).get("phase")
+                                else {"session": SESSION, "expires_at": "x",
+                                      "player": {"id": "p", "name": "Ama", "kind": "member"},
+                                      "scope": {"tournament": None}}})
+    r = client.post("/v1/embed/sessions", json={"player_token": PLAYER})
+    assert r.status_code == 201 and r.json()["session"] == SESSION
+    assert payloads(log)[-1]["parent_origin"] is None
+
+
+@pytest.mark.parametrize("origin", ["https://a.com/path", "a.com", "javascript:alert(1)", "https://a.com\nx"])
+def test_a_parent_origin_is_an_origin(monkeypatch, origin):
+    log = install(monkeypatch)
+    assert client.post("/v1/embed/sessions", json={"player_token": PLAYER, "parent_origin": origin}).status_code == 422
+    assert log == []
 
 
 @pytest.mark.parametrize("token", [ORG_KEY, SESSION, "ochp_" + "2B" * 24, "ochp_short"])
@@ -435,11 +472,106 @@ def test_the_bundle_is_public_cached_and_shaped(monkeypatch):
     assert out["tournament"]["entry"] == {"count": 1, "cap": 16, "full": False, "open": True}
     assert "owner_id" not in out["tournament"] and out["tournament"]["note"] == "Postponed by 15 minutes."
     assert out["org"] == {"slug": "yoursite", "name": "Yoursite", "website": "https://yoursite.com", "brand": {},
-                          "badge": "full"}
+                          "badge": "full", "allowed_origins": ["https://yoursite.com"]}
     assert out["standings"]["lines"][0]["player"]["display_name"] == "Ama"
     assert out["hosted_url"] == "https://www.ocheso.com/o/yoursite/weekly"
     [body] = payloads(log)
     assert body["kind"] == "emb-bundle" and body["slug"] == "weekly" and "preview" not in body
+
+
+def _result(n, board, white, black, status="finished", result="white"):
+    return {"game_id": f"g{n}-{board}", "round_number": n, "round_status": "finished" if status == "finished" else "live",
+            "board": board, "white_id": white, "black_id": black, "status": status, "result": result,
+            "termination": "checkmate" if status == "finished" else None, "tiebreak_of": None, "finished_at": None}
+
+
+def test_the_bundle_carries_every_round_for_the_bracket(monkeypatch):
+    # A knockout of eight, three rounds in: the bracket needs round 1 too.
+    people = [{"id": p, "name": p.upper(), "username": None, "avatar_url": None, "country": None, "kind": "member"}
+              for p in "abcdefgh"]
+    results = [_result(1, b + 1, w, k) for b, (w, k) in enumerate([("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")])]
+    results += [_result(2, 1, "a", "c"), _result(2, 2, "e", "g"), _result(3, 1, "a", "e", "live", None)]
+    raw = {**BUNDLE, "tournament": {**BUNDLE["tournament"], "format": "knockout", "status": "live"},
+           "roster": [], "people": people, "results": results,
+           "rounds": [{"number": n, "status": "finished" if n < 3 else "live", "created_at": None, "started_at": None,
+                       "finished_at": None} for n in (1, 2, 3)],
+           "live": [{"id": "g3-1", "round": 3, "board": 1, "white_id": "a", "black_id": "e", "position": "x",
+                     "turn": "white", "ply": 4, "last_move": None, "white_ms": 1, "black_ms": 1,
+                     "turn_started_at": None, "topic": None}]}
+    install(monkeypatch, {"embed_call": raw})
+    out = client.get("/v1/embed/t/weekly").json()
+    assert [(r["number"], r["status"], len(r["games"])) for r in out["rounds"]] == [(1, "finished", 4), (2, "finished", 2),
+                                                                                   (3, "live", 1)]
+    first = out["rounds"][0]["games"][0]
+    assert first["result"] == "white"
+    # Lean: names and results, never a move list; a player is a name and an id.
+    assert set(first) == {"id", "board", "white", "black", "status", "result", "termination", "tiebreak_of"}
+    assert first["white"] == {"id": "a", "display_name": "A", "username": None}
+    assert "moves" not in json.dumps(out["rounds"])
+
+
+def test_a_swiss_bundle_keeps_the_current_and_previous_round(monkeypatch):
+    # Thirty-nine rounds of a round robin, or of a Swiss: the latest two (D3),
+    # older ones are on /rounds; an arena's games stay its latest 100.
+    results = [_result(n, 1, "a", "b") for n in range(1, 40)]
+    results += [{**_result(1, None, "a", "b"), "game_id": f"arena-{i}", "round_number": None} for i in range(150)]
+    for fmt in ("round_robin", "swiss"):
+        install(monkeypatch, {"embed_call": {**BUNDLE, "tournament": {**BUNDLE["tournament"], "format": fmt},
+                                             "results": results}})
+        out = client.get("/v1/embed/t/weekly").json()
+        assert [r["number"] for r in out["rounds"] if r["number"] is not None] == [38, 39]
+        [arena] = [r for r in out["rounds"] if r["number"] is None]
+        assert len(arena["games"]) == 100 and arena["games"][-1]["id"] == "arena-149"
+
+
+def _big(players: int, rounds: int, fmt: str, live: int = 0) -> dict:
+    """A large event as emb-bundle reads it: every name long, every avatar a
+    long URL - the heaviest a bundle's people can be."""
+    ids = [f"{i:08x}-0000-4000-8000-{i:012x}" for i in range(players)]
+    people = [{"id": p, "name": f"Player Number {i:04d}", "username": f"player{i:04d}",
+               "avatar_url": "https://lh3.googleusercontent.com/a/ACg8ocK" + "x" * 60 + "=s96-c", "country": "CM",
+               "kind": "member"} for i, p in enumerate(ids)]
+    size = lambda n: players // 2 if fmt != "knockout" else max(1, players >> n)  # noqa: E731
+    results = [{**_result(n, b + 1, ids[(2 * b + n) % players], ids[(2 * b + 1 + n) % players]),
+                "game_id": f"{n:04d}{b:04d}-0000-4000-8000-000000000000"}
+               for n in range(1, rounds + 1) for b in range(size(n))]
+    games = [{"id": f"live-{b}", "round": rounds, "board": b + 1, "white_id": ids[2 * b], "black_id": ids[2 * b + 1],
+              "position": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1", "turn": "black", "ply": 1,
+              "last_move": "e2e4", "white_ms": 300000, "black_ms": 300000, "turn_started_at": "2026-10-25T12:00:00Z",
+              "topic": "0123456789abcdef0123456789abcdef"} for b in range(live)]
+    return {**BUNDLE, "tournament": {**BUNDLE["tournament"], "format": fmt, "status": "live", "max_participants": players,
+                                     "games_watchable": True, "participants_visible": True},
+            "roster": [{**BUNDLE["roster"][0], "participant_id": p, "user_id": p, **{k: q[k] for k in ("name", "username",
+                        "avatar_url", "country")}} for p, q in zip(ids, people)],
+            "people": people, "results": results, "live": games}
+
+
+def test_a_knockout_bundle_keeps_its_bracket_until_it_is_too_big(monkeypatch):
+    # A knockout of 2048 holds 2047 games in all: the whole bracket goes in.
+    install(monkeypatch, {"embed_call": _big(2048, 11, "knockout")})
+    out = client.get("/v1/embed/t/weekly").json()
+    assert [r["number"] for r in out["rounds"]] == list(range(1, 12))
+    # Of 4096, in round 2: round 1's 2048 games would pass BUNDLE_GAMES, so the
+    # bracket starts at round 2 (the view says earlier rounds aren't shown).
+    install(monkeypatch, {"embed_call": _big(4096, 2, "knockout")})
+    assert [r["number"] for r in client.get("/v1/embed/t/weekly").json()["rounds"]] == [2]
+    # The newest round always goes in whole, however big.
+    install(monkeypatch, {"embed_call": _big(4096, 1, "knockout")})
+    [first] = client.get("/v1/embed/t/weekly").json()["rounds"]
+    assert len(first["games"]) == 2048
+
+
+def test_the_biggest_bundle_stays_far_below_what_a_function_may_answer(monkeypatch):
+    # 4096 players, 13 Swiss rounds, the last one in play: 26,624 games, 2048
+    # live. Whole, that is about 20 MB; Vercel answers at most 4.5 MB.
+    install(monkeypatch, {"embed_call": _big(4096, 13, "swiss", live=2048)})
+    r = client.get("/v1/embed/t/weekly")
+    assert r.status_code == 200
+    assert len(r.content) < 3 * 1024 * 1024, len(r.content)
+    out = r.json()
+    assert len(out["standings"]["lines"]) == 4096
+    assert [(x["number"], len(x["games"])) for x in out["rounds"]] == [(13, 2048)]
+    assert len(out["live"]) == 100 and out["live"][0]["board"] == 1 and out["live"][0]["white"]["display_name"]
 
 
 def test_a_preview_is_for_the_organiser_and_never_cached(monkeypatch):
@@ -521,10 +653,25 @@ def test_ping_is_text_plain_and_answers_any_origin(monkeypatch):
     assert r.status_code == 204 and r.headers["access-control-allow-origin"] == "*"
     [sent] = payloads(log)
     assert sent["kind"] == "emb-ping" and sent["origin"] == "https://yoursite.com" and sent["t"] == "weekly"
-    assert "o" not in sent  # the database tells t from o by which key is present
+    assert "o" not in sent and "s" not in sent  # the database tells t from o by which key is present
     for bad in ("not json", json.dumps({"origin": "https://a.com"}), json.dumps({"t": "w", "o": "x", "origin": "https://a.com"}),
-                json.dumps({"t": "w", "origin": "javascript:x"}), "x" * 3000):
-        assert client.post("/v1/embed/ping", content=bad, headers={"Content-Type": "text/plain"}).status_code in (400, 413)
+                json.dumps({"s": "friday", "origin": "https://a.com"}), json.dumps({"t": "w", "s": "x", "origin": "https://a.com"}),
+                json.dumps({"t": "w", "origin": "javascript:x"}), json.dumps({"t": "w", "origin": "https://a.com", "path": "club"}),
+                "x" * 3000):
+        assert client.post("/v1/embed/ping", content=bad, headers={"Content-Type": "text/plain"}).status_code in (400, 413), bad
+
+
+def test_the_loaders_beacon_pings_for_a_series(monkeypatch):
+    log = install(monkeypatch, {"embed_call": None})
+    for path in ("", None, "   "):
+        body = {"s": "friday-blitz", "o": "yoursite", "origin": "https://yoursite.com", "view": "series"}
+        if path is not None:
+            body["path"] = path
+        r = client.post("/v1/embed/ping", content=json.dumps(body), headers={"Content-Type": "text/plain"})
+        assert r.status_code == 204, (path, r.text)
+        sent = payloads(log)[-1]
+        assert sent["kind"] == "emb-ping" and sent["s"] == "friday-blitz" and sent["o"] == "yoursite" and "t" not in sent
+        assert sent["path"] is None  # missing or empty: no path, never ""
 
 
 # --- refusals ---------------------------------------------------------------------
